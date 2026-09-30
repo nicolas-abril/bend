@@ -92,6 +92,10 @@ type Arg = [Q, HTerm, HTerm, HTerm | null];
 // a kernel binder: its quantity, level and type
 type Binder = [Q, number, O];
 
+// a model search pass: its steps left, and whether a datatype whose name
+// is on the path is a cycle
+type Pass = { n: number; name: boolean };
+
 // a Σ chain being split: fields left, and the variables its match
 // convoys, which the arm binds again after the chain
 type Chain = { n: number; cv: number[] };
@@ -132,7 +136,7 @@ type Safe = {
 // a Nat literal longer than this goes out as arithmetic on shorter ones
 const NAT_MAX = 4096;
 
-// the steps a model search takes before it finds none: a nested
+// the steps a model search pass takes before it finds none: a nested
 // datatype's search meets a new type at every step
 const MODEL_MAX = 4096;
 
@@ -434,42 +438,49 @@ function type_drop(e: Safe, T: HTerm, cols: Cols): HTerm {
 // converts, else a live λ variable of type T (the codomain's own, so it
 // is used once); none for an empty type. A projection model takes that
 // variable first: a law like {a == sub(add(a, b), b)} holds of it, one
-// like {add(a, b) == add(b, a)} of a constant. It reads the model book,
-// as the kernel checks a model with every opaque def at its own
+// like {add(a, b) == add(b, a)} of a constant. A pass past MODEL_MAX
+// steps finds none; when all do, the passes run again with a datatype
+// whose name is on the path as a cycle, which ends (a nested datatype
+// like Nest<A> finds NNil). It reads the model book, as the kernel
+// checks a model with every opaque def at its own
 
 function model(e: Safe, T: HTerm): HTerm | null {
-  const at = (proj: boolean): HTerm | null => {
-    const left = { n: MODEL_MAX };
-    const m = model_at(e, T, 0, [], [], proj, left);
-    return left.n < 0 ? null : m;
+  const at = (proj: boolean, name: boolean): HTerm | null => {
+    const pass = { n: MODEL_MAX, name };
+    const m = model_at(e, T, 0, [], [], proj, pass);
+    // lowered and raised, a use of its λs substitutes into the body built here
+    return pass.n < 0 || m === null ? null : B.term_higher(B.term_lower(m));
   };
-  return at(false) ?? at(true);
+  return at(false, false) ?? at(true, false) ?? at(false, true) ?? at(true, true);
 }
 
-function model_at(e: Safe, T: HTerm, d: number, path: HTerm[], hs: Array<[HTerm, HTerm]>, proj: boolean, left: { n: number }): HTerm | null {
-  if (--left.n < 0) {
+function model_at(e: Safe, T: HTerm, d: number, path: HTerm[], hs: Array<[HTerm, HTerm]>, proj: boolean, pass: Pass): HTerm | null {
+  if (--pass.n < 0) {
     return null;
   }
   const F = B.term_wnf(e.mb, T);
-  const hyp = (): HTerm | null => hs.find(([, A]) => B.term_compare("EQ", e.mb, A, F, d))?.[0] ?? null;
+  const eq = (A: HTerm): boolean => B.term_compare("EQ", e.mb, A, F, d);
+  const hyp = (): HTerm | null => hs.find(([, A]) => eq(A))?.[0] ?? null;
   switch (F.$) {
     case "Typ": {
       return B.ADT("Unit", []);
     }
     case "All": {
-      // the body is built again at each use, so each use gets its own steps
-      const f = (x: HTerm, left: { n: number }): HTerm | null => model_at(e, F.B(x), d + 1, path, F.q.$ === "None" ? hs : [...hs, [x, F.A]], proj, left);
-      return f(B.Var(F.k, d), left) === null ? null : B.Ann(B.Lam(F.k, d, (x: HTerm) => f(x, { n: MODEL_MAX }) as HTerm), F);
+      // the body is built once; a use in this pass at another argument
+      // searches again (the pass is dropped if that runs out)
+      const f = (x: HTerm): HTerm | null => model_at(e, F.B(x), d + 1, path, F.q.$ === "None" ? hs : [...hs, [x, F.A]], proj, pass);
+      const b = f(B.Var(F.k, d));
+      return b === null ? null : B.Ann(B.Lam(F.k, d, (x: HTerm) => x.$ === "Var" && x.i === d ? b : f(x) ?? x), F);
     }
     case "ADT": {
       const tld = e.mb.tlds[F.k] as ADT;
       const h = proj ? hyp() : null;
-      const seen = (): boolean => path.some((P) => P.$ === "ADT" && P.k === F.k && B.term_compare("EQ", e.mb, P, F, d));
-      for (const c of h !== null || seen() ? [] : tld.c.filter((c) => !F.r.includes(c.k))) {
+      const stop = h !== null || path.some((P) => P.$ === "ADT" && P.k === F.k && (pass.name || eq(P)));
+      for (const c of stop ? [] : tld.c.filter((c) => !F.r.includes(c.k))) {
         const xs: HTerm[] = [];
         let U = B.term_wnf(e.mb, B.tele_fill(e.mb, c.T, F.x, B.ctx_nil()));
         let x: HTerm | null = null;
-        while (U.$ === "All" && (x = model_at(e, U.A, d, [...path, F], [], proj, left)) !== null) {
+        while (U.$ === "All" && (x = model_at(e, U.A, d, [...path, F], [], proj, pass)) !== null) {
           xs.push(x);
           U = B.term_wnf(e.mb, U.B(x));
         }
