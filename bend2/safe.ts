@@ -438,9 +438,12 @@ function type_drop(e: Safe, T: HTerm, cols: Cols): HTerm {
 // as the kernel checks a model with every opaque def at its own
 
 function model(e: Safe, T: HTerm): HTerm | null {
-  const left = { n: MODEL_MAX };
-  const m = model_at(e, T, 0, [], [], false, left) ?? model_at(e, T, 0, [], [], true, left);
-  return left.n < 0 ? null : m;
+  const at = (proj: boolean): HTerm | null => {
+    const left = { n: MODEL_MAX };
+    const m = model_at(e, T, 0, [], [], proj, left);
+    return left.n < 0 ? null : m;
+  };
+  return at(false) ?? at(true);
 }
 
 function model_at(e: Safe, T: HTerm, d: number, path: HTerm[], hs: Array<[HTerm, HTerm]>, proj: boolean, left: { n: number }): HTerm | null {
@@ -454,14 +457,15 @@ function model_at(e: Safe, T: HTerm, d: number, path: HTerm[], hs: Array<[HTerm,
       return B.ADT("Unit", []);
     }
     case "All": {
-      const f = (x: HTerm): HTerm | null => model_at(e, F.B(x), d + 1, path, F.q.$ === "None" ? hs : [...hs, [x, F.A]], proj, left);
-      return f(B.Var(F.k, d)) === null ? null : B.Ann(B.Lam(F.k, d, (x: HTerm) => f(x) as HTerm), F);
+      // the body is built again at each use, so each use gets its own steps
+      const f = (x: HTerm, left: { n: number }): HTerm | null => model_at(e, F.B(x), d + 1, path, F.q.$ === "None" ? hs : [...hs, [x, F.A]], proj, left);
+      return f(B.Var(F.k, d), left) === null ? null : B.Ann(B.Lam(F.k, d, (x: HTerm) => f(x, { n: MODEL_MAX }) as HTerm), F);
     }
     case "ADT": {
       const tld = e.mb.tlds[F.k] as ADT;
       const h = proj ? hyp() : null;
-      const seen = path.some((P) => B.term_compare("EQ", e.mb, P, F, d));
-      for (const c of seen || h !== null ? [] : tld.c.filter((c) => !F.r.includes(c.k))) {
+      const seen = (): boolean => path.some((P) => P.$ === "ADT" && P.k === F.k && B.term_compare("EQ", e.mb, P, F, d));
+      for (const c of h !== null || seen() ? [] : tld.c.filter((c) => !F.r.includes(c.k))) {
         const xs: HTerm[] = [];
         let U = B.term_wnf(e.mb, B.tele_fill(e.mb, c.T, F.x, B.ctx_nil()));
         let x: HTerm | null = null;

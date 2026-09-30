@@ -1,7 +1,9 @@
 # a ~ parameter's model search ends: a datatype whose argument holds a λ
 # meets itself again under a ∀-typed field (its lowered key named the
 # λ's depth, so it never repeated), and a nested datatype, which meets a
-# new type at every step, runs out of steps and has no model
+# new type at every step, runs out of steps and has no model; a function
+# of it still has one, found by the projection search on its own steps,
+# and its λ body gets fresh steps at each use
 import Base
 
 type W<-F: Nat -> Type> is Type:
@@ -16,6 +18,9 @@ type Nest<-A: Type> is Type:
 
 def g(~n: Nest<Nat>, y: Nat) -> Nat:
   y
+
+def h(~k: Nest<Nat> -> Nest<Nat>, n: Nest<Nat>) -> Nest<Nat>:
+  k(n)
 
 #|ALL PROOFS CHECK
 #|Use --verdict for mathematical validity.
