@@ -355,7 +355,7 @@ def File.read(file: File, max: U32) ->
 
 # The next line with its "\n", up to max bytes, so a terminal or a pipe
 # answers each line as it comes; "" at the end of the file, or when max
-# is 0.
+# is 0 (which still fails, as File.read does, on a handle that can't read).
 def File.read_line(file: File, max: U32) ->
   IO(File & Result<&1, &1, U32 & String, String>):
   import "./effs/file_read.c"
@@ -2245,12 +2245,46 @@ def String.contains.if(t: String, p: String, here: Bool) -> Bool:
     case True{}:
       True{}
 
+law String.contains.pre:
+  for p: String
+  for s: String
+  Bool
+
+def String.contains.pre.if(pt: String, t: String, same: Bool) -> Bool:
+  match same:
+    case False{}:
+      False{}
+    case True{}:
+      String.contains.pre(pt, t)
+
+# String.starts_with.go's walk under a name only String.contains reaches.
+# String.contains lends it both strings at every position, so it borrows them
+# in every program; String.starts_with.go owns its strings as soon as one
+# caller hands them over, and a borrowed search would then count each tail.
+def String.contains.pre(p, s):
+  match p s:
+    case SNil{} _:
+      True{}
+    case SCon{y, yt} SNil{}:
+      False{}
+    case SCon{y, yt} SCon{x, xt}:
+      String.contains.pre.if(yt, xt, Char.is_eq(x, y))
+
+# Whether p is a prefix of SCon{h, t}, from the node's two fields: testing a
+# position rebuilds no node, so the search neither allocates nor counts.
+def String.contains.at(p: String, h: Char, t: String) -> Bool:
+  match p:
+    case SNil{}:
+      True{}
+    case SCon{y, yt}:
+      String.contains.pre.if(yt, t, Char.is_eq(h, y))
+
 def String.contains(s, p):
   match s:
     case SNil{}:
       String.is_empty(p)
     case SCon{h, t}:
-      String.contains.if(t, p, String.starts_with(SCon{h, t}, p))
+      String.contains.if(t, p, String.contains.at(p, h, t))
 
 def String.take(s: String, n: Nat) -> String:
   match s n:
@@ -3352,8 +3386,21 @@ def Map.from_list(a, -V: Kind(a), kvs: List<a, Sigma<&2, a, String, _ => V>>) ->
   Map<a, V>:
   Map.from_list.go(a, V, kvs, MTip{})
 
+def Map.union.into(a, -V: Kind(a), m: Map<a, V>, n: Map<a, V>) -> Map<a, V>:
+  match m:
+    case MTip{}:
+      n
+    case left:
+      Map.from_list.go(a, V, Map.to_list(a, V, n), left)
+
 def Map.union(a, -V: Kind(a), m: Map<a, V>, n: Map<a, V>) -> Map<a, V>:
-  Map.from_list.go(a, V, Map.to_list(a, V, n), m)
+  match n:
+    case MTip{}:
+      m
+    case MLeaf{k, v}:
+      Map.set(a, V, m, k, v)
+    case right:
+      Map.union.into(a, V, m, right)
 
 def Map.size(a, -V: Kind(a), m: Map<a, V>) -> Nat:
   match m:
