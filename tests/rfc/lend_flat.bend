@@ -105,6 +105,36 @@ def par(+n: Nat, +t: Tree) -> U32:
       a b = sum(run(7n, t, []), U32.from_nat(n)) par(p, t)
       U32.add(a, U32.add(b, twins3(t, U32.is_eq(U32.mod(U32.from_nat(n), 2), 0))))
 
+# a closure made by the lent def captures the tree
+type Fn is Type:
+  Fn{f: U32 -> U32, tag: U32}
+
+def top(t: Tree) -> U32:
+  match t:
+    case Leaf{}:
+      7
+    case Node{l, k, r}:
+      k
+
+def later(z: Bool, t: Tree) -> Fn:
+  match z:
+    case True{}:
+      Fn{x => U32.add(x, top(t)), 1}
+    case False{}:
+      Fn{x => x, 2}
+
+def call(g: Fn, x: U32) -> U32:
+  match g:
+    case Fn{f, n}:
+      U32.add(n, f(x))
+
+def clo(+n: Nat, +t: Tree, acc: U32) -> U32:
+  match n:
+    case 0n:
+      U32.add(acc, dig(t, 9))
+    case 1n+p:
+      clo(p, t, U32.add(acc, call(later(U32.is_eq(U32.mod(U32.from_nat(n), 2), 0), t), 1)))
+
 def main() -> IO(Unit):
   do IO<Unit>:
     Unit <- IO.print(U32.show(sum(run(40n, gen(4n, 1), []), 0)))
@@ -112,7 +142,8 @@ def main() -> IO(Unit):
     Unit <- IO.print(U32.show(sum(fresh(300n, []), 0)))
     Unit <- IO.print(U32.show(U32.add(twins(gen(3n, 1), True{}), twins(gen(3n, 2), False{}))))
     Unit <- IO.print(U32.show(U32.add(twins3(gen(3n, 1), True{}), twins3(lit(), False{}))))
-    IO.print(U32.show(par(200n, gen(6n, 1))))
+    Unit <- IO.print(U32.show(par(200n, gen(6n, 1))))
+    IO.print(U32.show(clo(50n, gen(4n, 1), 0)))
 
 #|2799445384
 #|3296398237
@@ -120,3 +151,4 @@ def main() -> IO(Unit):
 #|4130772560
 #|653109127
 #|3949310216
+#|2252982881

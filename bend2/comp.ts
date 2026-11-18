@@ -2179,7 +2179,10 @@ function emit_clo(sc: Scope, x: HTerm, ty: HTerm | null): Val {
   const name = seg_name("c");
   const clo = seg_clo(sc, seg_fid(name), words);
   const arg = val_new([name_local(sc, "x")], BOX);
-  emit_body(seg_open(sc, name, BOX, null, live, arg, [x]), x, ty, [arg], null);
+  // a lent word is kept as it is captured: the closure owns it
+  const held = live.map(([p, b]): [Of<"Var">, Bind] => [p, { ...b, val: {
+    ...b.val, rs: b.val.rs.map((r) => r === "+" ? null : r) } }]);
+  emit_body(seg_open(sc, name, BOX, null, held, arg, [x]), x, ty, [arg], null);
   return val_new([clo], BOX);
 }
 
