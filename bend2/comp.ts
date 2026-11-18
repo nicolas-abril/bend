@@ -1444,17 +1444,19 @@ function node_fields(sc: Scope, t: string, r: string | null, k: Name,
   if (lay_packed(node)) {
     return val_arm(val_new(node.ks.map(() => `term_loc(${t})`), node));
   }
-  const taken = r === null && (fact("ctr", k) || fact("stat", k));
+  // Only a hot constructor's node can be counted: a static one is read in
+  // place, its cell no spare.
+  const hot = r === null && fact("ctr", k);
+  const taken = hot || r === null && fact("stat", k);
   const sp = name_local(sc, "sp");
-  const fb = taken ? name_local(sc, "fb") : "";
-  if (taken) {
+  const fb = hot ? name_local(sc, "fb") : "";
+  if (hot) {
     file_push(sc, `Term ${fb}[${n}];`);
   }
-  file_push(sc, `u64 ${sp} = ${taken
-    ? `ctr_take(e, ${t}, ${n}, ${fb}, ${Number(fact("ctr", k))})`
+  file_push(sc, `u64 ${sp} = ${hot ? `ctr_take(e, ${t}, ${n}, ${fb})`
     : r === null ? `term_loc(${t})` : `term_peek(e.mem, ${t})`};`);
   const ws = emit_hold(sc, node.ks.map((_, j) =>
-    taken ? `${fb}[${j}]` : `e.mem[${sp} + ${j}]`), "f", node.ks);
+    hot ? `${fb}[${j}]` : `e.mem[${sp} + ${j}]`), "f", node.ks);
   const spare = { cls: cls_fit(n), name: sp, taken };
   if (r === null && tail) {
     sc.spares.push(spare);
@@ -4147,11 +4149,10 @@ NEAR(FAR) u64 span_fade(Env e, Term t, u64 src, u32 n) {
 
 #define COPY(D, S, N) for (u64 i_ = 0, n_ = (N); i_ != n_; i_ += 1) (D)[i_] = (S)[i_]
 
-// Only a hot constructor's node can be counted.
-INLINE u64 ctr_take(Env e, Term t, u32 n, THR Term* out, bool hot) {
-  u64 src = hot ? term_peek(e.mem, t) : term_loc(t);
+INLINE u64 ctr_take(Env e, Term t, u32 n, THR Term* out) {
+  u64 src = term_peek(e.mem, t);
   COPY(out, e.mem + src, n);
-  return hot && term_rfc(t) ? span_fade(e, t, src, n) : src;
+  return term_rfc(t) ? span_fade(e, t, src, n) : src;
 }
 
 INLINE Term term_word(Env e, Term w) {
@@ -5627,7 +5628,7 @@ FAR char* io_cbuf(Env e, Term s, u64* len, u64 cons) {
       if (root) {
         COPY(fb, e.mem + term_peek(e.mem, s), 2);
       } else {
-        spare_free(e, cls_fit(2), ctr_take(e, s, 2, fb, 1));
+        spare_free(e, cls_fit(2), ctr_take(e, s, 2, fb));
       }
       if (n + 5 > cap) {
         cap *= 2;
@@ -5925,7 +5926,7 @@ static void io_step(Env e, IoWork* a) {
     Term fs[256];
     u32  n = cid_arity(c);
     if (term_tag(req) == TAG_PAK) fs[0] = term_loc(req);
-    else spare_free(e, cls_fit(n), ctr_take(e, req, n, fs, 1));
+    else spare_free(e, cls_fit(n), ctr_take(e, req, n, fs));
     if (c == CID(Halt) || c == CID(Exit)) {
       if (c == CID(Halt)) io_errs(e, fs[1]);
       if ((u32)fs[0] > 255) err_fail("exit code must be in 0..255");
