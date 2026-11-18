@@ -4068,9 +4068,8 @@ FAR void term_drop(Env e, Term t) {
   }
 }
 
-// The host drops a count inline and frees a constructor node at once: its
-// spine field loops and the others recurse, to a depth; the rest is
-// term_drop's walk.
+// The host frees a constructor node at once: its spine field loops and the
+// others recurse, to a depth; the rest is term_drop's walk.
 #if !DEVICE
 INLINE bool rfc_last(Env e, Term* t) {
   if (term_rfc(*t)) {
@@ -4110,18 +4109,20 @@ FAR void term_fall(Env e, Term t, u32 d) {
     t = nx;
   }
 }
-#endif
 
-INLINE void term_sink(Env e, Term t) {
-#if DEVICE
-  if (!term_triv(t)) {
-    term_drop(e, t);
-  }
-#else
+FAR void term_sunk(Env e, Term t) {
   if (rfc_last(e, &t)) {
     term_fall(e, t, 0);
   }
+}
+#else
+#define term_sunk term_drop
 #endif
+
+INLINE void term_sink(Env e, Term t) {
+  if (!term_triv(t)) {
+    term_sunk(e, t);
+  }
 }
 
 // Inlined, M1 Metal runs wrong (#1954).
