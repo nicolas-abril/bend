@@ -3272,6 +3272,12 @@ using namespace metal;
 #endif
 #endif
 #define FAR static __attribute__((noinline))
+// A counted node's take and wrap are inline on the host.
+#if DEVICE
+#define NEAR(Q) Q
+#else
+#define NEAR(Q) INLINE
+#endif
 
 // The device inlines a spin once per caller, so a long one is a call there.
 // The host lets clang decide, but for a long F32 loop (emit_native).
@@ -3872,7 +3878,7 @@ INLINE bool term_triv(Term t) {
   return term_tag(t) <= TAG_PAK || t == TERM_HOLE || term_loc(t) < HEAP_OFF;
 }
 
-OUTLINE Term rfc_wrap(Env e, Term t, u32 cnt) {
+NEAR(OUTLINE) Term rfc_wrap(Env e, Term t, u32 cnt) {
   if (term_tag(t) == TAG_CLO || term_tag(t) == TAG_TSK) {
     err_post(e.mem, ERR_RFCS);
     return t;
@@ -4031,14 +4037,59 @@ FAR void term_drop(Env e, Term t) {
   }
 }
 
+// The host frees a constructor node at once: its spine field loops and the
+// others recurse, to a depth; the rest is term_drop's walk.
+#if !DEVICE
+FAR void term_fall(Env e, Term t, u32 d) {
+  DEV u64* H = e.mem;
+  for (;;) {
+    u32 aux = term_aux(t);
+    u32 n = term_tag(t) == TAG_CTR && d < 64 ? cid_arity(aux) : 255;
+    if (n > ${WIDE}) {
+      term_drop(e, t);
+      return;
+    }
+    u64 loc = term_loc(t);
+    if (term_rfc(t)) {
+      DEV u32* p = a32_at(H, loc);
+      if ((a32_sub_rel(p, 1) & RFC_CNT) != 1) {
+        return;
+      }
+      a32_acq(p);
+      u64 r = loc;
+      loc = H[r] >> 24;
+      heap_free(e, 0, r);
+      if (loc < HEAP_OFF) {
+        return;
+      }
+    }
+    u32 at = n - 1 - CID_T[aux].spine;
+    Term nx = n ? H[loc + at] : 0;
+    for (u32 j = 0; j < n; j += 1) {
+      Term c = H[loc + j];
+      if (j != at && !term_triv(c)) {
+        term_fall(e, c, d + 1);
+      }
+    }
+    heap_free(e, cls_fit(n), loc);
+    if (term_triv(nx)) {
+      return;
+    }
+    t = nx;
+  }
+}
+#else
+#define term_fall(e, t, d) term_drop(e, t)
+#endif
+
 INLINE void term_sink(Env e, Term t) {
   if (!term_triv(t)) {
-    term_drop(e, t);
+    term_fall(e, t, 0);
   }
 }
 
 // Inlined, M1 Metal runs wrong (#1954).
-FAR u64 span_fade(Env e, Term t, u64 src, u32 n) {
+NEAR(FAR) u64 span_fade(Env e, Term t, u64 src, u32 n) {
   DEV u32* c = a32_at(e.mem, term_loc(t));
   if ((a32_load(c) & RFC_CNT) == 1) {
     a32_acq(c);
