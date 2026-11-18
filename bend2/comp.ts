@@ -520,6 +520,14 @@ function term_uses(tm: HTerm): Bend.PMap<number> {
   });
 }
 
+// The least uses of p along any path: a match takes its least arm.
+function path_use(tm: HTerm, p: Of<"Var">): number {
+  const t = term_force(tm);
+  const ns = term_kids(t).map((x) => path_use(x, p));
+  return t.$ === "Var" ? Number(t.i === p.i) : t.$ === "Efq" ? Infinity
+    : t.$ === "Mat" ? Math.min(...ns) : ns.reduce((a, b) => a + b, 0);
+}
+
 function rest_use(rest: HTerm[], p: Of<"Var">): number {
   return rest.reduce((n, r) =>
     n + (Bend.pmap_get(term_uses(r), p.i) ?? 0), 0);
@@ -1442,7 +1450,8 @@ function node_fields(sc: Scope, t: string, r: string | null, k: Name,
   if (taken) {
     file_push(sc, `Term ${fb}[${n}];`);
   }
-  file_push(sc, `u64 ${sp} = ${taken ? `ctr_take(e, ${t}, ${n}, ${fb})`
+  file_push(sc, `u64 ${sp} = ${taken
+    ? `ctr_take(e, ${t}, ${n}, ${fb}, ${Number(fact("ctr", k))})`
     : r === null ? `term_loc(${t})` : `term_peek(e.mem, ${t})`};`);
   const ws = emit_hold(sc, node.ks.map((_, j) =>
     taken ? `${fb}[${j}]` : `e.mem[${sp} + ${j}]`), "f", node.ks);
@@ -2150,7 +2159,8 @@ function emit_intr(sc: Scope, k: Name, m: Spine, ty: HTerm | null): Val {
   }
   const lays = fun_of(k).lays;
   const as = args.map((v, i) => val_own(val_to(sc, v, lays[i]))[0])
-    .map((w, i) => op_bare(m.args[i]) ? w : emit_alias(sc, w, "a"));
+    .map((w, i) => op_bare(m.args[i]) && !w.startsWith("term_keep") ? w
+      : emit_alias(sc, w, "a"));
   const lay = lay_of(ty);
   return Array.isArray(C)
     ? val_new(C.map((p) => emit_alias(sc, tpl(p, as), "a")), lay)
@@ -2618,7 +2628,8 @@ function emit_match(sc: Scope, x: Of<"Mat"> | Of<"Efq">,
         return [[`${sw} == ${Object.keys(lay.arms!).indexOf(k)}`, h,
           () => val_arm(u, k)]];
       }
-      // An arm whose box fields only re-form its node keeps the node whole.
+      // An arm that re-forms its node on every path, its box fields used
+      // for nothing else, keeps the node whole.
       const ctr = FL.book.ctrs[k], ds = ctr ? ctr_tail(ctr) : [];
       const lays = lay_node(k).arms![k];
       const arm = (cond: string, a: HTerm, skip: HTerm[]): typeof lv[0] => {
@@ -2626,7 +2637,7 @@ function emit_match(sc: Scope, x: Of<"Mat"> | Of<"Efq">,
         const [c, g] = !ctr ? [a, -1] : arm_self(a, ctr.n - m, self, (ps) =>
           Bend.Ctr(k, [...skip, ...ps]), (j) => dom_live(ds[m + j]) && lays[
           ds.slice(0, m + j).filter(dom_live).length].ks.includes("box"));
-        const [b, f] = rest_use([c], self) > 0 ? [c, g] : [a, -1];
+        const [b, f] = path_use(c, self) > 0 ? [c, g] : [a, -1];
         return [cond, b, (al) => {
           const fs = node_fields(al, sw, f < 0 ? u.rs[0] : u.rs[0] ?? "s", k,
             true).slice(f ? m : lays.length);
@@ -4135,10 +4146,11 @@ NEAR(FAR) u64 span_fade(Env e, Term t, u64 src, u32 n) {
 
 #define COPY(D, S, N) for (u64 i_ = 0, n_ = (N); i_ != n_; i_ += 1) (D)[i_] = (S)[i_]
 
-INLINE u64 ctr_take(Env e, Term t, u32 n, THR Term* out) {
-  u64 src = term_peek(e.mem, t);
+// Only a hot constructor's node can be counted.
+INLINE u64 ctr_take(Env e, Term t, u32 n, THR Term* out, bool hot) {
+  u64 src = hot ? term_peek(e.mem, t) : term_loc(t);
   COPY(out, e.mem + src, n);
-  return term_rfc(t) ? span_fade(e, t, src, n) : src;
+  return hot && term_rfc(t) ? span_fade(e, t, src, n) : src;
 }
 
 INLINE Term term_word(Env e, Term w) {
@@ -5614,7 +5626,7 @@ FAR char* io_cbuf(Env e, Term s, u64* len, u64 cons) {
       if (root) {
         COPY(fb, e.mem + term_peek(e.mem, s), 2);
       } else {
-        spare_free(e, cls_fit(2), ctr_take(e, s, 2, fb));
+        spare_free(e, cls_fit(2), ctr_take(e, s, 2, fb, 1));
       }
       if (n + 5 > cap) {
         cap *= 2;
@@ -5912,7 +5924,7 @@ static void io_step(Env e, IoWork* a) {
     Term fs[256];
     u32  n = cid_arity(c);
     if (term_tag(req) == TAG_PAK) fs[0] = term_loc(req);
-    else spare_free(e, cls_fit(n), ctr_take(e, req, n, fs));
+    else spare_free(e, cls_fit(n), ctr_take(e, req, n, fs, 1));
     if (c == CID(Halt) || c == CID(Exit)) {
       if (c == CID(Halt)) io_errs(e, fs[1]);
       if ((u32)fs[0] > 255) err_fail("exit code must be in 0..255");
