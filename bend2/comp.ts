@@ -1481,14 +1481,17 @@ function val_hold(sc: Scope, v: Val, k: string): Val {
 }
 
 function val_own(v: Val, at: string | null = null, held = false): string[] {
-  v.rs.forEach((r, j) => {
+  return v.ws.map((w, j) => {
+    const r = v.rs[j];
     if (r !== null && at !== null) {
       FL.unit!.lends.push([at, r]);
+    } else if (r?.[0] === "+") {
+      return `term_keep(e, ${w}, 1)`;
     } else if (r !== null || (at !== null && !held && v.lay.ks[j] === "box")) {
       fact_add("own", r ?? at!);
     }
+    return w;
   });
-  return v.ws;
 }
 
 function val_owned(v: Val): string[] {
@@ -1638,17 +1641,21 @@ function bind_pop(sc: Scope, x: HTerm, at: Lay | null): Val {
   if (at !== BOX && lay_lazy(b.val, lay)) {
     return val_unbox(sc, { ...b.val, rs: [p.k] }, lay);
   }
+  bind_keep(sc, b, "term_keep(e, $, 1)");
+  return b.val;
+}
+
+function bind_keep(sc: Scope, b: Bind, op: string): void {
   const fr = sc.seg.frame;
   const owned = val_owned(b.val);
   file_push(sc, ...owned.map((w) => {
     const s = fr?.pop === 0 ? fr.at[sc.seg.params.indexOf(w)] : undefined;
     const to = s === undefined ? "" : `STK(${s}) = `;
-    return `${to}${w} = term_keep(e, ${w}, 1);`;
+    return `${to}${w} = ${op.replace("$", w)};`;
   }));
   if (owned.length > 0) {
     facts_hot(sc.def, b.A, true);
   }
-  return b.val;
 }
 
 function bind_uses(sc: Scope, p: Of<"Var">, v: Val, rest: HTerm[],
@@ -2005,9 +2012,10 @@ function emit_jump(sc: Scope, args: string[], k: Name, bang = false): void {
     `WL_AGAIN(${sc.seg.fid});`);
 }
 
-function emit_args(sc: Scope, ck: Spine, jump = false, fork = false): Val[] {
+function emit_args(sc: Scope, ck: Spine, jump = false, fork = false,
+  lend: boolean[] | null = null): Val[] {
   const k = ck.k!;
-  const lays = fun_of(k).lays;
+  const { lays, live } = fun_of(k);
   const brw = brw_of(k);
   ck.all.forEach((a, q) =>
     fact("arg", arg_key(k, q)) && facts_hot(sc.def, a, true));
@@ -2016,7 +2024,13 @@ function emit_args(sc: Scope, ck: Spine, jump = false, fork = false): Val[] {
   const vs = ck.xs.map((a, i) => xs[i].$ === "Var" ? null
     : emit_expr({ ...sc, rest: [...xs.slice(i + 1).filter((x) =>
       x.$ !== "Var"), ...vars, ...sc.rest] }, a, null, lays[i]));
-  xs.forEach((x, i) => vs[i] ??= brw[i] ? null : bind_pop(sc, x, lays[i]));
+  // A flat def that does not loop is lent an owned box its caller still
+  // uses: the def keeps it where it owns it.
+  xs.forEach((x, i) => vs[i] ??= brw[i] || lend && (lend[i] = !!live[i]
+    && lays[i] === BOX && (ty_adt(live[i][2])?.k ?? "Array") !== "Array"
+    && loop_of(k).length === 0 && rest_use(sc.rest, probe_of(x)) > 0
+    && val_owned(sc.uses.get(probe_of(x))!.val).length > 0) ? null
+    : bind_pop(sc, x, lays[i]));
   return xs.map((x, i) => {
     const at = arg_key(k, i);
     let b = vs[i];
@@ -2036,10 +2050,14 @@ function emit_args(sc: Scope, ck: Spine, jump = false, fork = false): Val[] {
         bind_set(sc, p, bd, Math.max(bd.n - 1, 1));
       }
       b = bd.val;
+      if (lend?.[i]) {
+        bind_keep(sc, bd, "rfc_seal(e, $)");
+        return b;
+      }
     }
     const v = val_to(sc, b, lays[i]);
     if (!brw[i]) {
-      val_own(v);
+      return { ...v, ws: val_own(v), rs: v.rs.map(() => null) };
     } else if (!(vs[i] === null && v === b) && !ctr_packed(x)) {
       val_own(v, at);
     }
@@ -2068,8 +2086,9 @@ function emit_put(sc: Scope, dst: Val | null, v: Val): void {
 function emit_spin(sc: Scope, ck: Spine): Val {
   const k = ck.k!;
   const { lays, ret } = fun_of(k);
-  const ws = emit_args(sc, ck).flatMap((v) => v.ws);
-  const name = emit_native(sc, k);
+  const lend: boolean[] = [];
+  const ws = emit_args(sc, ck, false, false, lend).flatMap((v) => v.ws);
+  const name = emit_native(sc, k, lend);
   const o = name_local(sc, "o");
   const out = val_new(ret.ks.map((kd, j) =>
     `${kd === "w32" ? "(u32)" : ""}${o}[${j}]`), ret);
@@ -2086,20 +2105,21 @@ function emit_spin(sc: Scope, ck: Spine): Val {
 }
 
 // A foreign def's last parameter, past its live ones, is its continuation k.
-function emit_open(k: Name): [Scope, Val[]] {
+function emit_open(k: Name, lend: boolean[] = []): [Scope, Val[]] {
   const sc = scope_new();
   const { live, lays, ret } = fun_of(k);
   const brw = brw_of(k);
   const vals = lays.map((l, i) => val_new(l.ks.map(() =>
     name_local(sc, live[i]?.[1] ?? "k")), l, l.ks.map(() =>
-    brw[i] ? arg_key(k, i) : null)));
+    lend[i] ? "+" : brw[i] ? arg_key(k, i) : null)));
   return [{ ...sc, seg: seg_new(k, ret, vals), def: k }, vals];
 }
 
-function emit_native(sc: Scope, k: Name): string {
-  const name = name_id("spin_", k);
-  memo(FL.units, "spin " + k, (n) => unit_new(n, () => {
-    const [sl, vals] = emit_open(k);
+function emit_native(sc: Scope, k: Name, lend: boolean[] = []): string {
+  const key = k + lend.map((l, i) => l ? "~" + i : "").join("");
+  const name = name_id("spin_", key);
+  memo(FL.units, "spin " + key, (n) => unit_new(n, () => {
+    const [sl, vals] = emit_open(k, lend);
     const seg = Object.assign(sl.seg, { fid: name, native: true });
     emit_body(sl, fun_of(k).h!, tld_of(k).T, vals,
       val_new(seg.ret.ks.map((_, j) => `o[${j}]`), seg.ret));
