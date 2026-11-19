@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# The M4 measurement queue of this study, in order; every run waits for the
-# 1-minute load to fall under 3 (at most 30 min, then it runs anyway and the
-# load is on its line).
+# The M4 measurement queue of this study, in order; every run waits until
+# other processes use under 2.5 cores (at most 3 h, then it runs anyway; the
+# load and the others' use are on its line).
 set -u
 T=/private/tmp/bend-opt/par-tools/bench/par-measure; W=/private/tmp/bend-opt/par-work; cd $W
-G="--max-load 3 --max-wait 1800"
+G="--max-load 2.5 --max-wait 10800"
 B=bin; C=cnt; X=bt/bin
 # 1. forked binarytrees: builds, drafts, wait edits, twins
 python3 $T/ab.py --out bt_focus.jsonl --rounds 5 $G \
@@ -26,7 +26,7 @@ python3 $T/ab.py --out cnt_check.jsonl --rounds 5 --threads 1,def $G \
   bt_plain=$C/bt_main.plain bt_cnt=$C/bt_main.cnt fw_plain=$C/fw_main.plain fw_cnt=$C/fw_main.cnt
 for b in main p2164 p2183 int r2207; do for t in 1 4 def; do for r in 1 2 3; do
   for p in bt fw; do
-    python3 -c "import sys; sys.path.insert(0,'$T'); from scale import wait_quiet; wait_quiet(3,1800,False)"
+    python3 -c "import sys; sys.path.insert(0,'$T'); from scale import wait_quiet; wait_quiet(2.5,10800,False)"
     a=$([ $t = def ] && echo "" || echo "--threads $t")
     echo "{\"prog\":\"$p\",\"build\":\"$b\",\"threads\":\"$t\",\"load\":$(sysctl -n vm.loadavg | awk '{print $2}')}" >> cnt_runs.jsonl
     PAR_COUNT_OUT=$W/cnt_runs.jsonl $C/${p}_$b.cnt +RTS $a --gpu off -RTS > /dev/null

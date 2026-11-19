@@ -74,6 +74,7 @@ def run_one(exe, threads, timeout):
     rts = ["+RTS"] + ([] if threads == "def" else ["--threads", str(threads)]) \
         + ["--gpu", "off", "-RTS"]
     load = os.getloadavg()[0]
+    others = others_cpu()
     try:
         p = subprocess.run([TM, exe] + rts, capture_output=True, text=True,
                            timeout=timeout)
@@ -88,14 +89,30 @@ def run_one(exe, threads, timeout):
     return rec
 
 
+def others_cpu():
+    """Cores in use by processes outside this run's process group (ps %CPU)."""
+    me = os.getpgrp()
+    out = subprocess.run(["ps", "-A", "-o", "pgid=,pcpu="], capture_output=True,
+                         text=True).stdout
+    tot = 0.0
+    for line in out.splitlines():
+        g, c = line.split()
+        if int(g) != me:
+            tot += float(c)
+    return tot / 100.0
+
+
 def wait_quiet(max_load, max_wait, log):
-    """Wait (up to max_wait s) until the 1-minute load is under max_load."""
+    """Wait (up to max_wait s) until other processes use under max_load cores.
+
+    The 1-minute load average is not used: this run's own threads raise it.
+    """
     t0 = time.time()
-    while os.getloadavg()[0] > max_load and time.time() - t0 < max_wait:
+    while others_cpu() > max_load and time.time() - t0 < max_wait:
         time.sleep(15)
     waited = time.time() - t0
     if waited > 1 and log:
-        print("waited %.0f s for load %.1f" % (waited, os.getloadavg()[0]), flush=True)
+        print("waited %.0f s; others at %.1f cores" % (waited, others_cpu()), flush=True)
 
 
 def cmd_run(args):
@@ -176,7 +193,7 @@ if __name__ == "__main__":
     ap.add_argument("--out", default=os.path.join(WORK, "runs.jsonl"))
     ap.add_argument("-j", type=int, default=4)
     ap.add_argument("--max-load", type=float, default=1e9,
-                    help="pause before a run while the 1-minute load is above this")
+                    help="pause before a run while other processes use more cores than this")
     ap.add_argument("--max-wait", type=float, default=600,
                     help="the longest pause (s); the run then goes ahead")
     ap.add_argument("--force", action="store_true")

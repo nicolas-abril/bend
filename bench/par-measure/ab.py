@@ -15,11 +15,12 @@ import argparse, json, os, re, shlex, statistics, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from scale import TM, ensure_tm, wait_quiet
+from scale import TM, ensure_tm, wait_quiet, others_cpu
 
 
 def run(cmd, timeout=300):
     load = os.getloadavg()[0]
+    others = others_cpu()
     try:
         p = subprocess.run([TM] + cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -28,6 +29,7 @@ def run(cmd, timeout=300):
     rec = {k: (float(v) if re.match(r"^-?[\d.]+$", v) else v)
            for k, v in (kv.split("=") for kv in line.split())}
     rec["load"] = load
+    rec["others"] = others
     rec["out"] = (p.stdout.strip().splitlines() or [""])[-1]
     return rec
 
@@ -39,7 +41,7 @@ def table(path):
         if r.get("rc") == 0:
             g.setdefault((r["label"], r["threads"]), []).append(r)
     med = statistics.median
-    print("| variant | threads | wall ms med (min-max) | n | user | sys | vcsw | ivcsw | P% | runnable | load | out |")
+    print("| variant | threads | wall ms med (min-max) | n | user | sys | vcsw | ivcsw | P% | runnable | load/others | out |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     order = []
     for r in rs:
@@ -57,7 +59,7 @@ def table(path):
               f" | {med([x['user_ms'] for x in v]):.0f} | {med([x['sys_ms'] for x in v]):.0f}"
               f" | {med([x['vcsw'] for x in v]):.0f} | {med([x['ivcsw'] for x in v]):.0f}"
               f" | {med(pu):.0f} | {med([x.get('runnable_ms', 0) for x in v]):.0f}"
-              f" | {med([x['load'] for x in v]):.1f} | {' '.join(outs)} |")
+              f" | {med([x['load'] for x in v]):.1f}/{med([x.get('others', 0) for x in v]):.1f} | {' '.join(outs)} |")
     bad = [r for r in rs if r.get("rc") != 0]
     if bad:
         print(f"{len(bad)} failed runs", file=sys.stderr)

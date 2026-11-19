@@ -18,7 +18,9 @@
 // only in how the subtrees are dealt and joined. Not like for like with
 // Bend's allocation (Bend frees each node in check): compare modes with each
 // other, and Bend's builds with each other.
+#ifdef __APPLE__
 #include <dispatch/dispatch.h>
+#endif
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -154,10 +156,12 @@ int main(int argc, char** argv) {
   long acc = 0;
   for (int it = 0; it < 1200; it++) {
     if (gcd) {
+#ifdef __APPLE__
       dispatch_apply(n, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
         bump = arena[i];
         sub[i] = make(DEPTH - CUT);
       });
+#endif
     } else if (pool) {
       int wakers = NT - 1;
       if (TURNS == 2) pool_turn(0, wakers);
