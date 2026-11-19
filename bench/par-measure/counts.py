@@ -42,6 +42,9 @@ def summary(d):
         "pcore_pct": 100.0 * tot["task_ticks_p"] / max(tk, 1),
         "yields": tot["yields"], "cond_waits": tot["cond_waits"],
         "idle_us": tot["wait_ticks"] * ns,
+        "big_tasks_p": tot.get("big_p", 0), "big_tasks_e": tot.get("big_e", 0),
+        "big_pcore_pct": 100.0 * tot.get("big_ticks_p", 0) / max(tot.get("big_ticks_p", 0) + tot.get("big_ticks_e", 0), 1),
+        "big_us": (tot.get("big_ticks_p", 0) + tot.get("big_ticks_e", 0)) * ns,
         "row_grow": tot["row_grow"], "row_grow_passes": tot["row_grow_passes"],
         "claims": tot["claims"],
         # task length histogram: bucket i holds tasks of 2^i to 2^(i+1) ticks

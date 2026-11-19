@@ -73,23 +73,29 @@ def cmd_build(args):
 def run_one(exe, threads, timeout):
     rts = ["+RTS"] + ([] if threads == "def" else ["--threads", str(threads)]) \
         + ["--gpu", "off", "-RTS"]
-    r, w = os.pipe()
     load = os.getloadavg()[0]
     try:
         p = subprocess.run([TM, exe] + rts, capture_output=True, text=True,
-                           timeout=timeout, pass_fds=(w,),
-                           preexec_fn=lambda: os.dup2(w, 3))
+                           timeout=timeout)
     except subprocess.TimeoutExpired:
-        os.close(w); os.close(r)
         return {"rc": "timeout", "load": load}
-    os.close(w)
-    line = os.read(r, 4096).decode().strip()
-    os.close(r)
+    # tm's line is the last line of stderr that starts with rc=
+    line = ([l for l in p.stderr.splitlines() if l.startswith("rc=")] or [""])[-1]
     rec = {k: (float(v) if re.match(r"^-?[\d.]+$", v) else v)
            for k, v in (kv.split("=") for kv in line.split())}
     rec["load"] = load
     rec["out"] = (p.stdout.strip().splitlines() or [""])[-1]
     return rec
+
+
+def wait_quiet(max_load, max_wait, log):
+    """Wait (up to max_wait s) until the 1-minute load is under max_load."""
+    t0 = time.time()
+    while os.getloadavg()[0] > max_load and time.time() - t0 < max_wait:
+        time.sleep(15)
+    waited = time.time() - t0
+    if waited > 1 and log:
+        print("waited %.0f s for load %.1f" % (waited, os.getloadavg()[0]), flush=True)
 
 
 def cmd_run(args):
@@ -111,6 +117,7 @@ def cmd_run(args):
                         if group == "koru-seq" or name == "x/fork_wake_seq":
                             if t not in ("1", "def"):
                                 continue
+                        wait_quiet(args.max_load, args.max_wait, args.verbose)
                         rec = run_one(exe, t, args.timeout)
                         rec.update(prog=name, build=b, threads=t, round=rnd,
                                    time=time.time())
@@ -168,6 +175,10 @@ if __name__ == "__main__":
     ap.add_argument("--timeout", type=float, default=120)
     ap.add_argument("--out", default=os.path.join(WORK, "runs.jsonl"))
     ap.add_argument("-j", type=int, default=4)
+    ap.add_argument("--max-load", type=float, default=1e9,
+                    help="pause before a run while the 1-minute load is above this")
+    ap.add_argument("--max-wait", type=float, default=600,
+                    help="the longest pause (s); the run then goes ahead")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()

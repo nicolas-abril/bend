@@ -23,6 +23,11 @@ line goes to $PAR_COUNT_OUT (default: stderr):
   and inside cube_run, and per turn the work done (sum of the threads' busy
   ticks) and the busiest thread's share, aggregated.
 
+With BEND_METAL, also the GPU's split: gpu_probe and gpu_load (pipeline
+from the .gpu archive) ticks, gpu_pass calls and their ticks, command
+buffers, host ticks in waitUntilCompleted, the GPU's own busy seconds
+(sum of GPUEndTime - GPUStartTime) and when the first and last pass ran.
+
 Ticks are cntvct_el0, read at cntfrq_el0 (1 GHz on the M4, advancing in
 steps of about 41.7 ns); the dump gives tick_ns.
 """
@@ -34,17 +39,20 @@ HEAD = r'''
 #include <stdio.h>
 enum { PC_TASK0, PC_TASK1, PC_TASKJ, PC_PUSH, PC_DEAL, PC_MONK, PC_MONK_SEQ,
   PC_TK_P, PC_TK_E, PC_ROWGROW, PC_ROWGROW_IT, PC_CLAIMS, PC_BUSY, PC_YIELDS,
-  PC_CWAITS, PC_WAIT_TK, PC_N };
+  PC_CWAITS, PC_WAIT_TK, PC_BIG_P, PC_BIG_E, PC_BIGTK_P, PC_BIGTK_E, PC_N };
 static const char* PC_NAMES[] = { "task_call", "task_cont", "task_join", "push",
   "deal", "monk", "monk_seq", "task_ticks_p", "task_ticks_e", "row_grow",
   "row_grow_passes", "claims", "busy_ticks", "yields", "cond_waits",
-  "wait_ticks" };
+  "wait_ticks", "big_p", "big_e", "big_ticks_p", "big_ticks_e" };
 typedef struct { u64 v[PC_N]; u64 hist[24]; } __attribute__((aligned(256))) PcSlot;
 static PcSlot pc_slot[CUBE_T];
 static _Thread_local u32 pc_me;
 static u64 pc_turns[2], pc_turn_tk[2], pc_turn_work[2], pc_turn_max[2],
   pc_turn_rows[2], pc_cube, pc_cube_tk, pc_t_start, pc_turn_small, pc_turn_hist[24];
 static u64 pc_busy0[CUBE_T];
+static u64 pc_gpu_probe, pc_gpu_load, pc_gpu_passes, pc_gpu_pass_tk, pc_gpu_cbs,
+  pc_gpu_wait_tk, pc_gpu_first, pc_gpu_last;
+static double pc_gpu_kernel_s;
 static inline u64 pc_tick(void) {
   u64 v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v;
 }
@@ -59,7 +67,12 @@ static inline u32 pc_log2(u64 x) { return x ? 63 - __builtin_clzll(x) : 0; }
 #define PC_TASK_END(e, seq) do { u64 pc_d = pc_tick() - pc_t0; u32 pc_w = PC_E(e); \
     PcSlot* s = &pc_slot[pc_w]; s->v[PC_MONK] += 1; s->v[PC_MONK_SEQ] += (seq) != 0; \
     s->v[pc_c >= 6 ? PC_TK_P : PC_TK_E] += pc_d; \
-    s->hist[pc_log2(pc_d) < 23 ? pc_log2(pc_d) : 23] += 1; } while (0)
+    s->hist[pc_log2(pc_d) < 23 ? pc_log2(pc_d) : 23] += 1; \
+    if (pc_d >= PC_BIG) { s->v[pc_c >= 6 ? PC_BIG_P : PC_BIG_E] += 1; \
+      s->v[pc_c >= 6 ? PC_BIGTK_P : PC_BIGTK_E] += pc_d; } } while (0)
+#ifndef PC_BIG
+#define PC_BIG 32768
+#endif
 #define PC_TURN_BEGIN u64 pc_t0 = pc_tick(); \
   for (u32 i = 0; i < pool_size; i += 1) pc_busy0[i] = pc_slot[i].v[PC_BUSY];
 #define PC_TURN_END(grow, rows) do { u64 pc_d = pc_tick() - pc_t0, w = 0, m = 0; \
@@ -85,7 +98,13 @@ static void pc_dump(void) {
     pc_turn_work[0], pc_turn_max[1], pc_turn_max[0], pc_turn_rows[1],
     pc_turn_rows[0], pc_cube, pc_cube_tk);
   for (int i = 0; i < 24; i++) fprintf(f, "%s%llu", i ? "," : "", pc_turn_hist[i]);
-  fprintf(f, "],\"per_thread\":[");
+  fprintf(f, "],\"gpu_probe_ticks\":%llu,\"gpu_load_ticks\":%llu,\"gpu_passes\":%llu,"
+    "\"gpu_pass_ticks\":%llu,\"gpu_cmdbufs\":%llu,\"gpu_wait_ticks\":%llu,"
+    "\"gpu_busy_s\":%.6f,\"gpu_first_at\":%llu,\"gpu_last_at\":%llu",
+    pc_gpu_probe, pc_gpu_load, pc_gpu_passes, pc_gpu_pass_tk, pc_gpu_cbs,
+    pc_gpu_wait_tk, pc_gpu_kernel_s, pc_gpu_first ? pc_gpu_first - pc_t_start : 0,
+    pc_gpu_last ? pc_gpu_last - pc_t_start : 0);
+  fprintf(f, ",\"per_thread\":[");
   for (u32 w = 0; w < pool_size; w += 1) {
     fprintf(f, "%s{", w ? "," : "");
     for (int k = 0; k < PC_N; k++) fprintf(f, "%s\"%s\":%llu", k ? "," : "", PC_NAMES[k],
@@ -111,8 +130,28 @@ __attribute__((constructor)) static void pc_init(void) {
 #define PC_CUBE_BEGIN
 #define PC_CUBE_END ((void)0)
 #endif
+#if !DEVICE && defined(PAR_COUNT)
+#define PC_GPU(x) x
+#else
+#define PC_GPU(x)
+#endif
 // ---- end of counters ----
 '''
+
+GPU_EDITS = [
+    ("  const char* why = gpu != 0 && BANGS != 0 ? gpu_probe() : \"\";\n",
+     "  PC_GPU(u64 pc_g0 = pc_tick();)\n  const char* why = gpu != 0 && BANGS != 0 ? gpu_probe() : \"\";\n"
+     "  PC_GPU(pc_gpu_probe = pc_tick() - pc_g0;)\n"),
+    ("    gpu_load(size);\n",
+     "    PC_GPU(u64 pc_g0 = pc_tick();)\n    gpu_load(size);\n    PC_GPU(pc_gpu_load = pc_tick() - pc_g0;)\n"),
+    ("      gpu_pass(H);\n",
+     "      PC_GPU(u64 pc_g0 = pc_tick(); if (!pc_gpu_first) pc_gpu_first = pc_g0;)\n      gpu_pass(H);\n"
+     "      PC_GPU(pc_gpu_last = pc_tick(); pc_gpu_passes += 1; pc_gpu_pass_tk += pc_gpu_last - pc_g0;)\n"),
+    ("      [c waitUntilCompleted];\n",
+     "      PC_GPU(u64 pc_w0 = pc_tick();)\n      [c waitUntilCompleted];\n"
+     "      PC_GPU(pc_gpu_wait_tk += pc_tick() - pc_w0; if (c) { pc_gpu_cbs += 1;"
+     " pc_gpu_kernel_s += c.GPUEndTime - c.GPUStartTime; })\n"),
+]
 
 # (pattern, replacement, required); patterns are literal unless they start
 # with "re:". Each must match exactly once when required.
@@ -180,6 +219,10 @@ def patch(src):
         if n > 1 or (req and n != 1):
             raise SystemExit(f"patch_counters: {pat[:60]!r} matched {n} times")
         src = new
+    for pat, rep in GPU_EDITS:
+        if src.count(pat) > 1:
+            raise SystemExit(f"patch_counters: {pat[:60]!r} matched more than once")
+        src = src.replace(pat, rep)
     src = src.replace("// ---- end of counters ----", WAIT_MACROS + "// ---- end of counters ----", 1)
     # pool_turn's end: PC_TURN_END before its closing brace (the wait is last)
     m = re.search(r"OUTLINE void pool_turn\(bool grow, u32 rows\) \{\n(.*?)\n\}\n", src, re.S)
