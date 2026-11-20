@@ -5,7 +5,8 @@
     pgo.py prep [--builds main,int,ref] [NAME ...]   build everything
     pgo.py sweep --out F.jsonl [--rounds R] [--pos 16] [--builds ..] NAME ...
     pgo.py once --out F.jsonl [--rounds R] NAME ...     unpadded, interleaved
-    pgo.py table F.jsonl                                 per program summary
+    pgo.py table F.jsonl                                 per program and build
+    pgo.py summary F.jsonl                               Bend against C, plain and PGO
 
 Layout: $W/<name>/<build>/{tr,ms}/x.c (or x.cpp). tr/ holds the training
 source (sizes changed, progs.py) and its instrumented binary and profile;
@@ -18,11 +19,16 @@ on tr/x.c, one training run, `xcrun llvm-profdata merge`,
 `-fprofile-instr-use` on ms/x.c.
 
 Placement: the assembly gets `.p2align 6` and K `nop`s (K = 0..15, never
-executed) right before the earliest, in file order, of the functions whose
-largest block count is at least 2% of the program's largest (from the
-profile), and that function's own alignment becomes 4 bytes. So the hot
-code starts at 4*K bytes into a 64-byte line, and everything after it moves
-with it.
+executed) right before the earliest, in file order, of the functions present
+in the assembly whose largest block count is at least 2% of the largest
+among them (from the training profile); that function and every later one
+become 4-byte aligned. So the hot code starts at 4*K bytes into a 64-byte
+line, and everything after it moves with it.
+
+Cycles are P-core cycles: instructions times the run's cycles per
+instruction on performance cores (rusage v6), because other sessions' load
+moves single-thread runs between core types; a run counts when at least
+--pmin of its cycles are on P-cores.
 """
 import argparse, json, os, re, shutil, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -123,25 +129,37 @@ def prof_counts(d):
     return {f.split(":")[-1]: int(c) for f, c in re.findall(r"^\s+(\S+), max count = (\d+)", top, re.M)}
 
 
+def pad_lines(lines, fn_pick, k):
+    """The pad goes right before the label of the chosen function, in
+    __text (clang puts a function's 'Begin function' marker on its constant
+    pool when it has one); every later function in __text becomes 4-byte
+    aligned. fn_pick(present) -> the function to pad before, from the
+    (index, name) of the functions in __text."""
+    sec, begins = "", []
+    for i, l in enumerate(lines):
+        m = re.match(r"^\s*\.section\s+(\S+)", l)
+        if m:
+            sec = m.group(1)
+        m = re.search(r"-- Begin function (\S+)", l)
+        if m:
+            begins.append((i, m.group(1), sec.startswith("__TEXT,__text")))
+    fn = fn_pick([(i, f) for i, f, t in begins])
+    lab = next(i for i, l in enumerate(lines) if re.match(r"^_?" + re.escape(fn) + r":", l))
+    for i, f, t in begins:
+        if t and i >= lab:
+            lines[i] = re.sub(r"\.p2align\s+\d+(, 0x0)?", ".p2align\t2", lines[i])
+    lines[lab:lab] = ["\t.p2align\t6"] + (["\t.rept\t%d" % k, "\tnop", "\t.endr"] if k else [])
+    return fn
+
+
 def pad_asm(src, dst, counts, k):
     """Pad before the earliest function present in the assembly whose count
     is at least 2% of the largest count among the present ones."""
     lines = open(src).read().split("\n")
-    begins = []
-    for i, l in enumerate(lines):
-        m = re.search(r"-- Begin function (\S+)", l)
-        if m:
-            begins.append((i, m.group(1)))
-    present = [(i, f, counts.get(f, 0)) for i, f in begins]
-    mx = max(c for _, _, c in present)
-    idx, fn = next((i, f) for i, f, c in present if c * 50 >= mx)
-    # this function and every later one start 4-byte aligned, so that the
-    # whole tail moves in 4-byte steps (clang gives a few functions 16)
-    for i, _ in begins:
-        if i >= idx:
-            lines[i] = re.sub(r"\.p2align\s+\d+(, 0x0)?", ".p2align\t2", lines[i])
-    pad = ["\t.p2align\t6"] + (["\t.rept\t%d" % k, "\tnop", "\t.endr"] if k else [])
-    lines[idx:idx] = pad
+    def pick(present):
+        mx = max(counts.get(f, 0) for _, f in present)
+        return next(f for _, f in present if counts.get(f, 0) * 50 >= mx)
+    fn = pad_lines(lines, pick, k)
     open(dst, "w").write("\n".join(lines))
     return fn
 
@@ -196,9 +214,18 @@ def run_one(cmd, timeout=600, ref=False):
 
 
 def measure(args, padded):
+    """Every (variant, position) of a program once per round, positions
+    outermost so that all variants at one position run back to back. A slot
+    that already has a P-core run in --out is skipped (resume)."""
     P = progs()
     names = args.names or list(P)
     builds = args.builds.split(",")
+    done = set()
+    if os.path.exists(args.out):
+        for l in open(args.out):
+            r = json.loads(l)
+            if r.get("rc") == 0 and pshare(r) >= args.pmin:
+                done.add((r["name"], r["build"], r["kind"], r["pos"], r["round"]))
     with open(args.out, "a") as f:
         for name in names:
             jobs = []
@@ -209,29 +236,44 @@ def measure(args, padded):
                     ms = f"{W}/{name}/{b}/ms"
                     if os.path.exists(f"{ms}/plain"):
                         jobs += [(b, k, -1, f"{ms}/{k}") for k in ("plain", "pgo")]
+            jobs.sort(key=lambda j: j[2])
             for r in range(args.rounds):
                 for (b, kind, k, binary) in jobs:
+                    if (name, b, kind, k, r) in done:
+                        continue
                     while args.max_load and load() > args.max_load:
                         time.sleep(5)
-                    rec = run_one(run_cmd(None, b, binary), ref=(b == "ref"))
-                    rec.update(name=name, build=b, kind=kind, pos=k, round=r, load=load())
-                    f.write(json.dumps(rec) + "\n")
-                    f.flush()
+                    for t in range(args.tries):
+                        rec = run_one(run_cmd(None, b, binary), ref=(b == "ref"))
+                        rec.update(name=name, build=b, kind=kind, pos=k, round=r, load=load(), try_=t)
+                        f.write(json.dumps(rec) + "\n")
+                        f.flush()
+                        if pshare(rec) >= args.pmin:
+                            break
 
 
-def table(path):
+def pshare(r):
+    return r.get("pcycles", 0) / max(r.get("cycles", 1), 1)
+
+
+def pcyc(r):
+    """P-core cycles: instructions times the run's CPI on performance cores."""
+    return r["instr"] * r["pcycles"] / r["pinstr"]
+
+
+def table(path, pmin=0.5):
     import statistics as st
     rs = [json.loads(l) for l in open(path) if l.strip()]
     g = {}
     for r in rs:
-        if r.get("rc") != 0:
+        if r.get("rc") != 0 or pshare(r) < pmin:
             continue
         g.setdefault((r["name"], r["build"], r["kind"]), {}).setdefault(r["pos"], []).append(r)
     names = []
     for r in rs:
         if r["name"] not in names:
             names.append(r["name"])
-    print("| program | build | kind | instr G | cycles G least / median / most (per-position least) | P-core % | n |")
+    print("| program | build | kind | instr G | P-core cycles G least / median / most (per-position least) | P-core % | n |")
     print("|---|---|---|---:|---|---:|---:|")
     for n in names:
         for b in ("main", "int", "ref"):
@@ -239,11 +281,52 @@ def table(path):
                 if (n, b, k) not in g:
                     continue
                 pos = g[(n, b, k)]
-                best = [min(v, key=lambda r: r["cycles"]) for v in pos.values()]
-                cyc = sorted(r["cycles"] / 1e9 for r in best)
+                best = [min(v, key=pcyc) for v in pos.values()]
+                cyc = sorted(pcyc(r) / 1e9 for r in best)
                 ins = st.median(r["instr"] for v in pos.values() for r in v) / 1e9
                 pc = st.median(r["pcycles"] / max(r["cycles"], 1) for r in best) * 100
                 print(f"| {n} | {b} | {k} | {ins:.3f} | {cyc[0]:.3f} / {st.median(cyc):.3f} / {cyc[-1]:.3f} | {pc:.0f} | {sum(len(v) for v in pos.values())} |")
+
+
+def summary(path, pmin=0.5):
+    """Per program and Bend build: instructions and P-core cycles (median
+    over positions) of Bend and C, plain and PGO; the gap B/C plain and with
+    PGO on both; the share of the plain gap that PGO removes; and whether
+    PGO's change to Bend clears the placement range (no overlap)."""
+    import statistics as st
+    rs = [json.loads(l) for l in open(path) if l.strip()]
+    g = {}
+    for r in rs:
+        if r.get("rc") != 0 or pshare(r) < pmin:
+            continue
+        g.setdefault((r["name"], r["build"], r["kind"]), {}).setdefault(r["pos"], []).append(r)
+    def stat(n, b, k):
+        pos = g.get((n, b, k))
+        if not pos:
+            return None
+        cyc = sorted(min(pcyc(r) for r in v) / 1e9 for v in pos.values())
+        ins = st.median(r["instr"] for v in pos.values() for r in v) / 1e9
+        return dict(i=ins, lo=cyc[0], med=st.median(cyc), hi=cyc[-1], n=len(cyc))
+    names = []
+    for r in rs:
+        if r["name"] not in names:
+            names.append(r["name"])
+    print("| program | Bend | instr B/C plain | PGO | cycles B (plain range -> PGO range) | C (plain -> PGO) | gap plain | gap PGO | share of gap PGO removes | PGO on Bend clears placement |")
+    print("|---|---|---:|---:|---|---|---:|---:|---:|---|")
+    for n in names:
+        for b in ("main", "int"):
+            bp, bq = stat(n, b, "plain"), stat(n, b, "pgo")
+            cp, cq = stat(n, "ref", "plain"), stat(n, "ref", "pgo")
+            if not (bp and bq):
+                continue
+            rng = lambda s: f"{s['lo']:.3f}-{s['hi']:.3f}"
+            clear = "faster" if bq["hi"] < bp["lo"] else "slower" if bq["lo"] > bp["hi"] else "overlap"
+            if cp and cq:
+                gp, gq = bp["med"] / cp["med"], bq["med"] / cq["med"]
+                share = f"{(gp - gq) / (gp - 1):.0%}" if gp > 1.02 else "-"
+                print(f"| {n} | {b} | {bp['i'] / cp['i']:.2f} | {bq['i'] / cq['i']:.2f} | {rng(bp)} -> {rng(bq)} | {rng(cp)} -> {rng(cq)} | {gp:.3f} | {gq:.3f} | {share} | {clear} |")
+            else:
+                print(f"| {n} | {b} | - | - | {rng(bp)} -> {rng(bq)} | - | - | - | - | {clear} |")
 
 
 def main():
@@ -255,6 +338,8 @@ def main():
     ap.add_argument("--rounds", type=int, default=1)
     ap.add_argument("--pos", type=int, default=16)
     ap.add_argument("--max-load", type=float, default=0)
+    ap.add_argument("--pmin", type=float, default=0.5, help="P-core share a run needs to count")
+    ap.add_argument("--tries", type=int, default=2, help="runs per slot until one is on P-cores")
     a = ap.parse_args()
     if a.cmd == "prep":
         P = progs()
@@ -271,7 +356,9 @@ def main():
     elif a.cmd == "once":
         measure(a, False)
     elif a.cmd == "table":
-        table(a.names[0])
+        table(a.names[0], a.pmin)
+    elif a.cmd == "summary":
+        summary(a.names[0], a.pmin)
 
 
 if __name__ == "__main__":
