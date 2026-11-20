@@ -33,7 +33,8 @@ step cnt_check
 python3 $T/ab.py --out cnt_check.jsonl --rounds 5 --threads 1,def $G \
   bt_plain=$C/bt_main.plain bt_cnt=$C/bt_main.cnt fw_plain=$C/fw_main.plain fw_cnt=$C/fw_main.cnt
 step counted
-counted() {  # counted LABEL BINARY THREADS
+counted() {  # counted LABEL BINARY THREADS (one unrecorded warm run first)
+  PAR_COUNT_OUT=/dev/null $2 +RTS --gpu off -RTS > /dev/null 2>&1
   for i in 1 2 3 4 5 6; do
     python3 -c "import sys; sys.path.insert(0,'$T'); from scale import wait_quiet; wait_quiet(2.5,10800,False)"
     b=$(python3 -c "import sys; sys.path.insert(0,'$T'); from scale import others_cpu; print(others_cpu())")

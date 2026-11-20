@@ -79,12 +79,13 @@ def run_one(exe, threads, timeout):
         p = subprocess.run([TM, exe] + rts, capture_output=True, text=True,
                            timeout=timeout)
     except subprocess.TimeoutExpired:
-        return {"rc": "timeout", "load": load}
+        return {"rc": "timeout", "load": load, "others": others}
     # tm's line is the last line of stderr that starts with rc=
     line = ([l for l in p.stderr.splitlines() if l.startswith("rc=")] or [""])[-1]
     rec = {k: (float(v) if re.match(r"^-?[\d.]+$", v) else v)
            for k, v in (kv.split("=") for kv in line.split())}
     rec["load"] = load
+    rec["others"] = others
     rec["out"] = (p.stdout.strip().splitlines() or [""])[-1]
     return rec
 
@@ -123,6 +124,13 @@ def cmd_run(args):
     os.environ["PAR_SRC"] = src
     ps = program_set(args, {"x": src})
     threads = args.threads.split(",")
+    # one unrecorded run of each binary first: macOS scans a new binary on
+    # its first exec (hundreds of ms of wall with no CPU)
+    for name in ps:
+        for b in builds:
+            exe = os.path.join(BIN, b, name.replace("/", "__"))
+            if os.path.exists(exe):
+                run_one(exe, "def", args.timeout)
     with open(args.out, "a") as f:
         for rnd in range(args.rounds):
             for name, (_, want, group, twin) in ps.items():

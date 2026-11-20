@@ -6,8 +6,8 @@
 //   rc wall_ms user_ms sys_ms vcsw ivcsw rss_mb instr cycles pinstr pcycles
 //   puser_ms psys_ms runnable_ms
 // The p* fields are the share spent on performance cores (macOS
-// RUSAGE_INFO_V6); runnable_ms is time the threads were ready to run but
-// waited for a core. The child is spawned with posix_spawn and waited with
+// RUSAGE_INFO_V6); runnable_ms is the threads' runnable time, on a core or
+// waiting for one (less user and sys, the time waiting for a core). The child is spawned with posix_spawn and waited with
 // waitid(WNOWAIT) so proc_pid_rusage can read it before it is reaped.
 #include <libproc.h>
 #include <spawn.h>
