@@ -38,7 +38,7 @@ def table(path):
     rs = [json.loads(l) for l in open(path) if l.strip()]
     g = {}
     for r in rs:
-        if r.get("rc") == 0:
+        if r.get("rc") == 0 and not r.get("busy"):
             g.setdefault((r["label"], r["threads"]), []).append(r)
     med = statistics.median
     print("| variant | threads | wall ms med (min-max) | n | user | sys | vcsw | ivcsw | P% | runnable | load/others | out |")
@@ -90,8 +90,14 @@ def main():
                     else:
                         argv = shlex.split(cmd) + ["+RTS"] + \
                             ([] if t == "def" else ["--threads", t]) + ["--gpu", "off", "-RTS"]
-                    wait_quiet(a.max_load, a.max_wait, False)
-                    rec = run(argv)
+                    for tries in range(6):
+                        wait_quiet(a.max_load, a.max_wait, False)
+                        rec = run(argv)
+                        rec["others_after"] = others_cpu()
+                        if max(rec["others"], rec["others_after"]) <= a.max_load:
+                            break
+                        rec["redone"] = tries + 1
+                    rec["busy"] = max(rec["others"], rec["others_after"]) > a.max_load
                     rec.update(label=label, threads=t, round=rnd, time=time.time())
                     f.write(json.dumps(rec) + "\n")
                     f.flush()

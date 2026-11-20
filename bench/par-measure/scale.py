@@ -134,8 +134,14 @@ def cmd_run(args):
                         if group == "koru-seq" or name == "x/fork_wake_seq":
                             if t not in ("1", "def"):
                                 continue
-                        wait_quiet(args.max_load, args.max_wait, args.verbose)
-                        rec = run_one(exe, t, args.timeout)
+                        for tries in range(6):
+                            wait_quiet(args.max_load, args.max_wait, args.verbose)
+                            rec = run_one(exe, t, args.timeout)
+                            rec["others_after"] = others_cpu()
+                            if max(rec["others"], rec["others_after"]) <= args.max_load:
+                                break
+                            rec["redone"] = tries + 1
+                        rec["busy"] = max(rec["others"], rec["others_after"]) > args.max_load
                         rec.update(prog=name, build=b, threads=t, round=rnd,
                                    time=time.time())
                         if want is not None and rec.get("out") != want:
@@ -152,7 +158,7 @@ def load_runs(path):
 
 
 def cmd_table(args):
-    runs = [r for r in load_runs(args.out) if r.get("rc") == 0]
+    runs = [r for r in load_runs(args.out) if r.get("rc") == 0 and not r.get("busy")]
     if args.only:
         runs = [r for r in runs if re.search(args.only, r["prog"])]
     key = lambda r: (r["prog"], r["build"], r["threads"])
