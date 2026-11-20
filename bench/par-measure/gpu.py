@@ -11,9 +11,16 @@ setup; the perf gate warms each cell too) and then --rounds timed runs of
 `X +RTS --gpu SPAN -RTS`, SPAN being the perf gate's MEMORY entry for the
 bench (else "on"), through tm. `split` runs cnt_X once warm and once
 measured and keeps the counted line: device probe, pipeline load, passes,
-command buffers, the GPU's own busy time, the host's wait.
+command buffers, the GPU's own busy time, the host's wait. The busy time
+sums GPUEndTime - GPUStartTime over command buffers, and up to three are in
+flight, so it can exceed the passes' wall time (overlap is counted twice).
+Each run waits until other processes use under 2.5 cores (added after the
+2026-11-20 run, which had no gate).
 """
 import argparse, json, os, re, subprocess, sys, time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from scale import others_cpu, wait_quiet
 
 WORK = os.environ.get("PAR_WORK", "/private/tmp/bend-opt/par-work")
 TM = os.path.join(WORK, "tm")
@@ -31,13 +38,16 @@ def span(name):
 
 
 def tm(exe, args, env=None):
+    wait_quiet(2.5, 10800, False)
     load = os.getloadavg()[0]
+    others = others_cpu()
     p = subprocess.run([TM, exe] + args, capture_output=True, text=True,
                        timeout=300, env=env)
     line = ([l for l in p.stderr.splitlines() if l.startswith("rc=")] or [""])[-1]
     rec = {k: (float(v) if re.match(r"^-?[\d.]+$", v) else v)
            for k, v in (kv.split("=") for kv in line.split())}
     rec["load"] = load
+    rec["others"] = others
     rec["out"] = (p.stdout.strip().splitlines() or [""])[-1]
     return rec
 

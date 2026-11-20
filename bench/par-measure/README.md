@@ -43,6 +43,9 @@ in `gates/repo.ts`' allow list. Paths default to /private/tmp/bend-opt/par-work
   or two turns a tree, libdispatch).
 - `gpu.py run|split DIR`: Metal wall times (a warm run first; the perf
   gate's GPU spans) and the counted split.
+- `setup_m4.sh`: rebuilds every binary the queue needs from fresh worktrees.
+- `report.py`: the scaling table (speedups over one thread and over the
+  sequential twin) and the build comparison, from scale.py's runs.
 - `queue_m4.sh`: the whole M4 queue in order (binarytrees variants, #2141's
   repro, the cutoffs, counted against plain, counted runs per build, Metal,
   the matrix), every run gated on other processes' CPU use.
@@ -58,3 +61,12 @@ in `gates/repo.ts`' allow list. Paths default to /private/tmp/bend-opt/par-work
   0e2f38f7, the x86 (Ryzen 7 5800H laptop) runs, and one counted run of
   every forking program on main at the default thread count on a loaded M4
   (load 6 to 10: counts are good, times are not).
+- `results/m4/` (2026-11-20, main 0e2f38f7, quiet M4, every run gated on
+  other processes' CPU): the scaling matrix in three rounds
+  (`scale_all.jsonl`, `scale_table_all.md`, `builds_table_all.md`; round 0
+  is also in `results/m4_scale_round0_2026-11-20.jsonl`), forked
+  binarytrees (`bt_focus`, `cut_focus`), counted runs (`cnt_runs.jsonl`:
+  placement of the continuation, multi-turn turns), multi-turn wait edits
+  (`mt_focus`), Metal (`gpu_run`, `gpu_split`; no CPU gate on those),
+  kmeans against its pin commit (`km_focus`; `km_focus_v1` failed: the old
+  binary takes its flags without +RTS), #2141's repro (`fw_focus`).
