@@ -33,6 +33,9 @@ if [ $step = all ] || [ $step = part1 ]; then
   save "results: Part 1 sweeps" pgo/sweep1.jsonl pgo/summary1.md pgo/table1.md
 fi
 if [ $step = all ] || [ $step = hints ]; then
+  for p in symreg lexer; do for b in main int; do
+    python3 $Q/qe/expect.py $Q/pgo/w/$p/$b/ms/x.c $Q/qe/${p}_${b}_expect.c 2> /dev/null
+  done; done
   sh $Q/tools/qsweep3.sh; python3 tools/swp.py --table qsweep3.jsonl > qsweep3.md
   save "results: static hints against plain" qsweep3.jsonl qsweep3.md
 fi
