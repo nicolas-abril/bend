@@ -1,0 +1,97 @@
+== b_bfs  node=10
+== b_editdist  node=11
+== b_gameoflife  node=11
+== b_hashmap  node=3.34e+07  rfc_wrap=3.34e+07
+       33,357,824 rfc_wrap
+       33,357,824 node CCons w2
+== b_histogram  node=10  rfc_wrap=3
+== b_kmeans  node=3.15e+08
+      167,761,920 node Sl w3
+      146,791,680 node Sn w2
+== b_lexer  node=5.08e+08
+      507,510,491 node SCon w2
+== b_mandelbrot  node=11
+== b_merkle  node=8.39e+06
+        8,388,605 node Mn w3
+== b_nbody  node=11
+== b_queens  node=11
+== b_raytrace  node=11
+== b_symreg  node=8.13e+06
+        2,033,364 node Sub w2
+        2,033,332 node Add w2
+        2,030,659 node Mul w2
+        2,030,101 node Xor w2
+== b_terrain  node=11
+== b_tree-bitonic  node=4.26e+09
+    4,261,412,862 node Node w2
+== b_tree-matmul  node=2.45e+08
+      232,184,448 node Qd w4
+       12,484,608 node Vn w2
+== b_tree-radix  node=2.76e+08
+      261,836,690 node Mnode w2
+       14,135,624 node Concat w2
+== c_cfold  apply=6  clo=6  eta=2  node=1.28e+07  unbox=1
+       12,750,869 node Add w2
+== c_deriv  apply=77  clo=77  eta=33  node=3.37e+07  rfc_wrap=1.89e+07  unbox=10
+       18,946,286 rfc_wrap
+       23,732,021 node Mul w2
+        4,551,582 node Pow w2
+        3,175,641 node Add w2
+        2,264,556 node Ln w1
+== c_nqueens  apply=3  clo=3  eta=1  node=9.35e+06  rfc_wrap=9.35e+06
+        9,349,813 rfc_wrap
+        9,349,778 node Con w2
+== c_rbtree-ck-unsafe  apply=3  clo=3  eta=1  node=3.41e+08  rfc_wrap=2.12e+08
+      212,043,848 rfc_wrap
+      340,132,741 node Node w5
+          840,001 node Con w2
+== c_rbtree-ck  apply=3  clo=3  eta=1  node=5.01e+08  rfc_wrap=3.32e+08
+      331,732,743 rfc_wrap
+      499,699,135 node Node w5
+          840,001 node Con w2
+== c_rbtree-unsafe  apply=3  clo=3  eta=1  node=3.4e+08
+      340,132,741 node Node w5
+== c_rbtree  apply=3  clo=3  eta=1  node=5.04e+08
+      503,899,113 node Node w5
+== k_ackermann  node=5
+== k_binarytrees  node=9.83e+06
+        9,829,200 node Node w2
+== k_coins  node=7
+== k_collatz  node=9
+== k_coprime  node=8
+== k_digitsum  node=9
+== k_exprtree  node=3.28e+05
+          163,840 node Lit w1
+== k_factorial  node=10
+== k_fib  node=8
+== k_gcdsum  node=8
+== k_hanoi  node=9
+== k_isqrt  node=10
+== k_josephus  node=8
+== k_listops  node=3.2e+04
+== k_mutual  node=6
+== k_nestedloop  node=10
+== k_pascal  node=9
+== k_powmod  node=10
+== k_primes  node=6
+== k_tak  node=2
+== k_textstats  node=8
+== k_wordfreq  node=7
+== p_binarytrees  node=9.83e+06
+        9,829,200 node Node w2
+== p_coins  node=7
+== p_collatz  node=9
+== p_coprime  node=8
+== p_digitsum  node=9
+== p_factorial  node=10
+== p_fib  node=8
+== p_gcdsum  node=8
+== p_isqrt  node=10
+== p_mutual  node=6
+== p_nestedloop  node=10
+== p_pascal  node=9
+== p_powmod  node=10
+== p_primes  node=6
+== p_tak  node=2
+== p_textstats  node=8
+== p_wordfreq  node=7

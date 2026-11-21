@@ -1,0 +1,13 @@
+/private/tmp/bend-opt/rep/demos/app_pong_game_2d/main.bend 11835618634485010809 2984277480061352770
+/private/tmp/bend-opt/rep/demos/app_slash_boss_3d/main.bend 16932722063229916943 17918885917141409205
+/private/tmp/bend-opt/rep/demos/io_rollback_netcode/walkers_test.bend 6723354356169932778 15570952995541981575
+/private/tmp/bend-opt/rep/demos/pure_hvm5_mini/main.bend 14599097709165200057 14460478886287833528
+/private/tmp/bend-opt/rep/tests/gfx/app_linear.bend 9810698551901056595 11636626879020961533
+/private/tmp/bend-opt/rep/tests/gfx/app_play.bend 154035389743509042 3044834892739571725
+/private/tmp/bend-opt/rep/tests/parse/plus_binder_row.bend 7943333587337355682 9642748205917755099
+/private/tmp/bend-opt/rep/tests/reg/erased_field_call.bend 14286175102742290603 14828445343500205800
+/private/tmp/bend-opt/rep/tests/reg/nat_chain.bend 17761122200361966467 611802858451324309
+/private/tmp/bend-opt/rep/tests/reg/show_shared_layout.bend 12522030755990742522 12255768122615006847
+/private/tmp/bend-opt/rep/tests/reg/u32_literal_word_field.bend 141699344766600782 5686124408406316595
+/private/tmp/bend-opt/rep/tests/run/bst_insert.bend 13178988279622894553 16092063564589332286
+/private/tmp/bend-opt/rep/tests/show/array_elements.bend 15294171160357998823 10562981134833132718

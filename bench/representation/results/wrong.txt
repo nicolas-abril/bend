@@ -1,0 +1,8 @@
+nofixed: pack_adv:sameC pack_deep:sameC pack_foreign/t1:CAUGHT(rc=139,2l,) pack_foreign/t8:CAUGHT(rc=139,2l,)
+noreadmask: pack_adv/t1:CAUGHT(rc=0,14l,LIVE0) pack_adv/t8:CAUGHT(rc=0,14l,LIVE0) pack_deep/t1:CAUGHT(rc=0,14l,LIVE0) pack_deep/t8:CAUGHT(rc=0,14l,LIVE0) pack_foreign/t1:ok pack_foreign/t8:ok
+overlap: pack_adv/t1:CAUGHT(rc=0,14l,LIVE0) pack_adv/t8:CAUGHT(rc=0,14l,LIVE0) pack_deep/t1:CAUGHT(rc=0,14l,LIVE0) pack_deep/t8:CAUGHT(rc=0,14l,LIVE0) pack_foreign/t1:ok pack_foreign/t8:ok
+arity: pack_adv/t1:CAUGHT(rc=139,8l,) pack_adv/t8:CAUGHT(rc=139,8l,) pack_deep/t1:CAUGHT(rc=139,8l,) pack_deep/t8:CAUGHT(rc=139,8l,) pack_foreign/t1:ok pack_foreign/t8:ok
+spine: pack_adv/t1:CAUGHT(rc=0,14l,LIVE102260) pack_adv/t8:CAUGHT(rc=0,14l,LIVE102260) pack_deep/t1:CAUGHT(rc=139,11l,) pack_deep/t8:CAUGHT(rc=139,11l,) pack_foreign/t1:ok pack_foreign/t8:ok
+bits64: pack_adv/t1:CAUGHT(rc=139,12l,) pack_adv/t8:CAUGHT(rc=139,12l,) pack_deep/t1:CAUGHT(rc=139,12l,) pack_deep/t8:CAUGHT(rc=139,12l,) pack_foreign/t1:ok pack_foreign/t8:ok
+nowritemask: pack_adv/t1:ok pack_adv/t8:ok pack_deep/t1:ok pack_deep/t8:ok pack_foreign/t1:ok pack_foreign/t8:ok
+sparecls: pack_adv/t1:CAUGHT(rc=139,2l,) pack_adv/t8:CAUGHT(rc=139,2l,) pack_deep/t1:CAUGHT(rc=139,2l,) pack_deep/t8:CAUGHT(rc=139,2l,) pack_foreign/t1:ok pack_foreign/t8:ok

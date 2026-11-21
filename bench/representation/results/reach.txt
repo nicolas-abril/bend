@@ -1,0 +1,31 @@
+files with records: 862  failing to check: 623  hook errors: 55
+  err /private/tmp/bend-opt/rep/tests/io/audio_frame_clock.bend None Error: no .c import: AudioTest.clock
+  err /private/tmp/bend-opt/rep/tests/io/audio_monotonic_clock.bend None Error: no .c import: wall_clock_backwards
+  err /private/tmp/bend-opt/rep/tests/io/bundle_inline.bend None Error: no .c import: Bundle.inline
+  err /private/tmp/bend-opt/rep/tests/io/bundle_page_input.bend None Error: no .c import: Bundle.page_input
+  err /private/tmp/bend-opt/rep/tests/io/chan_nested_abandoned.bend None Error: no .c import: Host.drain
+types: 1061  recursive: 357  words: 704
+one-constructor one-field types: 83  words (already erased): 83  heap nodes: 0
+list-like types: 97  reached from a main: 83
+   listy benches hashmap/main.bend Chain
+   listy benches merkle/main.bend Path
+records whose tag/w32 words could share 56-bit words: 101  of 704
+   by group {'base': 2, 'benches': 4, 'demos': 58, 'tests': 37}
+   rec base BASE Tool [6, 5, 1]
+   rec base BASE Event [13, 11, 2]
+   rec benches lexer/main.bend Mode [2, 1, 1]
+   rec benches queens/main.bend Stats [3, 2, 1]
+   rec benches raytrace/main.bend Hit [3, 2, 1]
+   rec benches tree-radix/main.bend Chk [6, 5, 1]
+node constructors: 838  with a tag word: 20  packing drops a class: 5  fixed by foreign C (not packed): 0
+   hits by group {'perceus': 4, 'tests': 1}  reached: 5
+   hit perceus rbtree-ck-unsafe/main.bend Node [1, 64, 32, 1, 64] 5->3 cls 3->2 reached
+   hit perceus rbtree-ck/main.bend Node [1, 64, 32, 1, 64] 5->3 cls 3->2 reached
+   hit perceus rbtree-unsafe/main.bend Node [1, 64, 32, 1, 64] 5->3 cls 3->2 reached
+   hit perceus rbtree/main.bend Node [1, 64, 32, 1, 64] 5->3 cls 3->2 reached
+   hit tests reg/show_shared_layout.bend Other [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 32] 25->1 cls 5->0 reached
+node ctrs with a tag word, no class drop: 15
+defs with clo: 1491  sites: 5219  in reached defs: 3476
+defs with eta: 1518  sites: 5990  in reached defs: 3912
+defs with app: 310  sites: 390  in reached defs: 267
+closure sites by group: {'demos': 872, 'perceus': 12, 'tests': 4316, 'base': 19}
