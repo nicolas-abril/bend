@@ -1,0 +1,7 @@
+[bench/perceus] bench/perceus/cfold/main.bend
+[bench/perceus] bench/perceus/deriv/main.bend
+[bench/perceus] bench/perceus/nqueens/main.bend
+[bench/perceus] bench/perceus/rbtree-ck-unsafe/main.bend
+[bench/perceus] bench/perceus/rbtree-ck/main.bend
+[bench/perceus] bench/perceus/rbtree-unsafe/main.bend
+[bench/perceus] bench/perceus/rbtree/main.bend

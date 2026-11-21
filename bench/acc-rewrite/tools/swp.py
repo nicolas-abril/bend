@@ -121,6 +121,7 @@ def main():
     ap.add_argument("--table")
     ap.add_argument("--rounds", type=int, default=2)
     ap.add_argument("--pos", type=int, default=16)
+    ap.add_argument("--from", dest="pfrom", type=int, default=0, help="first position to run (resume)")
     ap.add_argument("--rts", action="store_true")
     ap.add_argument("--pmin", type=float, default=0.5, help="P-core share a run needs to count")
     ap.add_argument("--tries", type=int, default=2, help="runs per slot until one is on P-cores")
@@ -135,7 +136,7 @@ def main():
     rts = ["+RTS", "--threads", "1", "--gpu", "off", "-RTS"] if a.rts else []
     with open(a.out, "a") as f:
         for r in range(a.rounds):
-            for k in range(a.pos):
+            for k in range(a.pfrom, a.pos):
                 for (label, kk, b) in jobs:
                     if kk != k:
                         continue

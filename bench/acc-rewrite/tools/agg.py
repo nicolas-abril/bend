@@ -16,17 +16,14 @@ outer callee's parameter there is used, on every path, only as an operand of
 an add into another value (pk lam: the word itself, as #2175; pk mat: the
 fields of the matched record, as `queens`).
 """
-import collections, glob, json, os, sys
+import collections, glob, json, os, re, sys
 
 d = sys.argv[1]
-groups = {}
-for f in sorted(glob.glob(f"{d}/*.jsonl")):
-    g = os.path.basename(f)[:-6]
-    if g in ("t",):
-        continue
-    groups[g] = [json.loads(l) for l in open(f) if l.strip()]
+GROUPS = ["benches", "demos", "kernels", "par", "perceus", "tests"]
+groups = {g: [json.loads(l) for l in open(f"{d}/{g}.jsonl") if l.strip()] for g in GROUPS}
 
-base = [r for r in next(iter(groups.values())) if r["file"] == "BASE"]
+# Base's records once (every run writes them first)
+base = [r for r in groups["benches"] if r["file"] == "BASE"]
 prog = collections.defaultdict(list)  # (group, file) -> records
 for g, rs in groups.items():
     for r in rs:
@@ -76,6 +73,8 @@ def common(cons, c0, c):
     cand = None
     for r in cons:
         e = next((x for x in r.get("res", []) if x["c0"] == c0 and x["c"] == c), None)
+        if e is not None:
+            e = dict(e, ident=[] if e.get("rec") else [t for t in e["ident"] if c0 not in t])
         if e is None:
             # C0 or C has no arm here (impossible by typing) or no fields
             continue
@@ -98,13 +97,29 @@ P = out.append
 tot = collections.Counter()
 hits = []
 seen_base = set()
+DUP = set()
+
+
+def dup(key, r):
+    """a record seen already from another file of the same directory (an
+    imported module's def): counted once"""
+    k = (key[0], os.path.dirname(key[1]), json.dumps({a: b for a, b in r.items() if a != "file"}, sort_keys=True))
+    # an imported module's names carry its prefix (main:f, bend3d:T)
+    k = (k[0], k[1], re.sub(r'"[A-Za-z0-9_]+:', '"', k[2]))
+    if k in DUP:
+        return True
+    DUP.add(k)
+    return False
+
+
 for key, rs in prog.items():
     if any(r["kind"] == "fail" for r in rs):
         tot["files failing to check"] += 1
         continue
+    tot["files checked"] += 1
     cons, reach = consumers(key)
     for r in rs:
-        if r["kind"] != "mat":
+        if r["kind"] != "mat" or dup(key, r):
             continue
         tot["match chains"] += 1
         if r.get("skip"):
@@ -119,7 +134,15 @@ for key, rs in prog.items():
             continue
         tot["      and a constructor with fields (eligible)"] += 1
         tot[f"        eligible, scrutinee {r['scrut']}"] += 1
+        if all(e.get("rec") for e in r.get("res", [])):
+            tot["        eligible but every C with fields holds a T (recursive)"] += 1
         res = r.get("res", [])
+        for e in res:
+            for m in ("plain", "ident", "broad"):
+                e[m] = [t for t in e[m] if e["c0"] not in t]
+        if any(e.get("rec") and (e["ident"] or e["broad"]) for e in res):
+            tot["        hit only through a field of the type's own type (recursive: dropped)"] += 1
+        res = [e for e in res if not e.get("rec")]
         p = any(e["plain"] for e in res)
         i = any(e["ident"] for e in res)
         b = any(e["broad"] for e in res)
@@ -165,7 +188,10 @@ P("\nHits by def (chains = match chains in the core; triv = chains where C0's ar
   " type in the program accepts, or the first def that refuses):\n")
 P("| group | file | def | type | C0 -> C | chains | triv | plain | ident | broad only | at every consumer | reached from main |")
 P("|---|---|---|---|---|---:|---:|---:|---:|---:|---|---|")
-for k, a in agg.items():
+ntriv = sum(1 for a in agg.values() if a["triv"] == a["chains"])
+P(f"(Of {len(agg)} rows, {ntriv} are trivial in every chain: the match re-forms its scrutinee or ignores the fields,"
+  " so any constants do; they are listed after the others.)\n")
+for k, a in sorted(agg.items(), key=lambda kv: (kv[1]["triv"] == kv[1]["chains"], kv[1]["group"] == "tests", kv[0])):
     ev = ("yes " + ",".join(a["every"][0])) if a["every"] else (f"no ({a['bad']})" if a["bad"] else "no")
     P(f"| {a['group']} | {a['file']} | {a['def_']} | {a['fam']} | {a['c0']} -> {a['c']} | {a['chains']} | {a['triv']} |"
       f" {a['nplain']} | {a['nident']} | {a['nbroad']} | {ev} | {a['reach']} |")
@@ -179,6 +205,13 @@ for key, rs in prog.items():
     reach = next((set(r["defs"]) for r in rs if r["kind"] == "reach"), None)
     for r in rs:
         if r["kind"] != "call2":
+            continue
+        if dup(key, r):
+            # the same call in another file of the directory: it may be reached there
+            for (g, f, de, o, i, pos), a in h2.items():
+                if g == key[0] and os.path.dirname(f) == os.path.dirname(short(key[1])) and \
+                        re.sub(r"^\w+:", "", de) == re.sub(r"^\w+:", "", r["def"]) and pos == r["pos"] and reach is not None:
+                    a["reach"] = a["reach"] or (r["def"] in reach)
             continue
         t2["calls with a call to a def as an argument"] += 1
         u = r.get("use")
@@ -221,10 +254,13 @@ for key, rs in prog.items():
     if any(r["kind"] == "fail" for r in rs):
         continue
     for r in rs:
-        if r["kind"] != "mat" or r.get("skip"):
+        if r["kind"] != "mat" or r.get("skip") or dup(("bf",) + key[1:] if False else (key[0] + "/bf", key[1]), r):
             continue
         cs = r["ctrs"] or []
         if not (any(c.endswith("/0") for c in cs) and any(not c.endswith("/0") for c in cs)):
+            continue
+        if r.get("res") and all(e.get("rec") for e in r["res"]):
+            bf["matches on a recursive type with a nullary end (list-like): not the family"] += 1
             continue
         shape = "option" if len(cs) == 2 else "wider"
         bf[f"matches on a {shape}-shaped type"] += 1

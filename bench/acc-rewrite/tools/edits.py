@@ -16,6 +16,10 @@ the two steps of the accumulator rewrite (bench/acc-rewrite/README.md).
        pair into (sols, nodes).
   s12b (from s1's C)        both steps with the constant ret dropped:
        solve takes 13 words, r1's shape, compiled from the port's rows.
+  m1k  (from the port's C on main)  the Stats arms push k1 instead of k3
+       (their code is equal): one return target, as #2153 makes it on
+       opt/integration; nothing else changes. Isolates the second return
+       target from the tag test.
 """
 import re, sys
 
@@ -41,6 +45,14 @@ def must(pat, repl, s, count=0, flags=0):
 
 def fid_num(src, fid):
     return int(re.search(r"#define %s (\d+)\n" % fid, src).group(1))
+
+
+def m1k(src):
+    def solve(s):
+        s = must(r"STK\(8\) = FID_solve_k3;", "STK(8) = FID_solve_k1;", s)
+        s = must(r"task_node\(e, FID_solve_k3,", "task_node(e, FID_solve_k1,", s)
+        return must(r"term_tsk\(FID_solve_k3,", "term_tsk(FID_solve_k1,", s)
+    return sub_in(src, "FID_solve", solve)
 
 
 def s2a(src):

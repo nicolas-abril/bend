@@ -1,0 +1,17 @@
+bench/runtime/bfs/main.bend
+bench/runtime/editdist/main.bend
+bench/runtime/gameoflife/main.bend
+bench/runtime/hashmap/main.bend
+bench/runtime/histogram/main.bend
+bench/runtime/kmeans/main.bend
+bench/runtime/lexer/main.bend
+bench/runtime/mandelbrot/main.bend
+bench/runtime/merkle/main.bend
+bench/runtime/nbody/main.bend
+bench/runtime/queens/main.bend
+bench/runtime/raytrace/main.bend
+bench/runtime/symreg/main.bend
+bench/runtime/terrain/main.bend
+bench/runtime/tree-bitonic/main.bend
+bench/runtime/tree-matmul/main.bend
+bench/runtime/tree-radix/main.bend

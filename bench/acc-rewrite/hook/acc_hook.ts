@@ -399,7 +399,17 @@ function acc_mat(x: Of<"Mat">, scrut: string, scope: HTerm[], def: Name,
       const broad = ident.length ? ident : tryall((i) => [...consts(i),
         ...scope.map((v, j) => ["s" + j + ":" + (v as Of<"Var">).k, v] as [string, HTerm]),
         ...rs.map((v, j) => ["r" + j, v] as [string, HTerm])], true, 4);
-      res.push({ c0: c0.k, c: c.k, n: c.n, plain, ident, broad });
+      // a field of C's own type: C0 as C{..} would need a value of the
+      // type inside it (recursive), so no finite constant stands for it
+      let recf = false;
+      try {
+        const doms = Bend.tele_unbind(FL.book, c.T).doms;
+        recf = doms.slice(doms.length - c.n).some(([, , A]) =>
+          ty_adt(A)?.k === fam);
+      } catch {
+        recf = false;
+      }
+      res.push({ c0: c0.k, c: c.k, n: c.n, rec: recf, plain, ident, broad });
     }
   }
   rec.res = res;
