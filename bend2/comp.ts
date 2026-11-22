@@ -1511,6 +1511,1222 @@ function def_fix(k: Name): boolean {
   return true;
 }
 
+// Drop
+// ====
+
+// A datatype D{} | P{f..} with no parameters and U32 or Nat fields, whose
+// D{} acts as P{0, ..} at every match the program runs, keeps P alone: D{}
+// is built as P{0, ..} and every D arm goes, so a value has no tag word and
+// a match one arm where it had two. Each match on the type must have both
+// arms, D's equal to P's at zero fields once both are normalised (literals
+// folded, x + 0, x * 1 and the like dropped, and D{} read as P{0, ..}):
+// replacing every D{} by P{0, ..} is then a simulation, values related by it
+// going to related results at every match. It is a fact about this
+// program's uses, so every def it reaches is checked, and the type is
+// refused if a foreign def, main or a def's type names it or D (C, the
+// printer or a type would see D). Each def that builds or matches D is
+// written again without it and elaborated by bend.ts' def_check against the
+// type with one constructor; if one is refused, nothing changes. C only.
+
+type Drop = { T: Name; D: Name; P: Name; zs: Bend.LTerm[] };
+
+const DROP_U32: Record<string, (a: number, b: number) => number> =
+  Object.setPrototypeOf({
+    "U32.add": (a: number, b: number) => (a + b) >>> 0,
+    "U32.sub": (a: number, b: number) => (a - b) >>> 0,
+    "U32.mul": (a: number, b: number) => Math.imul(a, b) >>> 0,
+    "U32.and": (a: number, b: number) => (a & b) >>> 0,
+    "U32.or": (a: number, b: number) => (a | b) >>> 0,
+    "U32.xor": (a: number, b: number) => (a ^ b) >>> 0,
+  }, null);
+
+// the unit u of each operation (x op u = x; also u op x = x if it commutes)
+const DROP_UNIT: Record<string, [number, boolean]> = Object.setPrototypeOf({
+  "U32.add": [0, true], "U32.sub": [0, false], "U32.mul": [1, true],
+  "U32.or": [0, true], "U32.xor": [0, true], "U32.and": [0xFFFFFFFF, true],
+  "Nat.add": [0, true], "Nat.mul": [1, true] }, null);
+
+function drop_lit(t: HTerm): number | null {
+  const s = Bend.term_strip(t);
+  return s.$ === "Lit" && (s.k === "U32" || s.k === "Nat") ? s.v : null;
+}
+
+// t with literals folded, units dropped and D{} read as P{0, ..}.
+function drop_norm(t: HTerm, dr: Drop): HTerm {
+  const go = (u: HTerm): HTerm => {
+    const s = Bend.term_strip(u);
+    switch (s.$) {
+      case "Ctr": {
+        return s.k === dr.D ? Bend.Ctr(dr.P, dr.zs.map((z) =>
+          Bend.term_higher(z))) : { ...s, x: s.x.map(go) };
+      }
+      case "Lam": {
+        return { ...s, f: (y: HTerm) => go(s.f(y)) };
+      }
+      case "Let": {
+        return { ...s, v: s.v.map(go), f: (ys: HTerm[]) => go(s.f(ys)) };
+      }
+      case "App": {
+        const xs: HTerm[] = [];
+        let h: HTerm = s;
+        for (let c: HTerm = s; c.$ === "App"; c = Bend.term_strip(c.f)) {
+          xs.unshift(go(c.x));
+          h = Bend.term_strip(c.f);
+        }
+        const k = h.$ === "Ref" ? h.k : "";
+        const [a, b] = xs.map(drop_lit);
+        const u = DROP_UNIT[k];
+        if (xs.length === 2 && a !== null && b !== null
+          && (DROP_U32[k] || k === "Nat.add" && a + b <= 0xFFFFFFFF)) {
+          return Bend.Lit(k.slice(0, 3) as "U32" | "Nat",
+            DROP_U32[k] ? DROP_U32[k](a, b) : a + b);
+        }
+        if (xs.length === 2 && u && b === u[0]) {
+          return xs[0];
+        }
+        if (xs.length === 2 && u && u[1] && a === u[0]) {
+          return xs[1];
+        }
+        if (k === "U32.inc" && xs.length === 1 && a !== null) {
+          return Bend.Lit("U32", (a + 1) >>> 0);
+        }
+        return xs.reduce((f: HTerm, x) => Bend.App(f, x), go(h));
+      }
+      default: {
+        return s;
+      }
+    }
+  };
+  return go(t);
+}
+
+// Whether a and b are the same case tree with equal leaves, normalised.
+function drop_same(a: HTerm, b: HTerm, dr: Drop): boolean {
+  const x = Bend.term_strip(a);
+  const y = Bend.term_strip(b);
+  if (x.$ === "Lam" || y.$ === "Lam") {
+    const p = probe("x");
+    return x.$ === "Lam" && y.$ === "Lam" && drop_same(x.f(p), y.f(p), dr);
+  }
+  if (x.$ === "Mat" || y.$ === "Mat" || x.$ === "Efq" || y.$ === "Efq") {
+    if (x.$ !== y.$) {
+      return false;
+    }
+    if (x.$ === "Efq") {
+      return true;
+    }
+    const [A, B] = [mat_arms(x), mat_arms(y)];
+    return A.arms.length === B.arms.length && A.arms.every(([k, h], i) =>
+      B.arms[i][0] === k && drop_same(h, B.arms[i][1], dr))
+      && drop_same(A.end, B.end, dr);
+  }
+  return term_same(drop_norm(x, dr), drop_norm(y, dr));
+}
+
+// Every match chain on T in t, under fresh probes, and whether D is built.
+function drop_scan(t: HTerm, T: Name, f: (m: HTerm) => void): void {
+  const go = (u: HTerm, head: boolean): void => {
+    const s = Bend.term_strip(u);
+    switch (s.$) {
+      case "Lam": {
+        return go(s.f(probe(s.k)), true);
+      }
+      case "Let": {
+        s.v.forEach((v) => go(v, true));
+        return go(s.f(s.k.map(probe)), true);
+      }
+      case "App": {
+        go(s.f, true);
+        return go(s.x, true);
+      }
+      case "Ctr": {
+        return s.x.forEach((x) => go(x, true));
+      }
+      case "Mat": {
+        const on = FL.book.ctrs[s.k]?.f === T;
+        if (on && head) {
+          f(s);
+        }
+        go(s.h, true);
+        return go(s.m, !on);
+      }
+      case "Rwt": {
+        return go(s.f, true);
+      }
+    }
+  };
+  go(t, true);
+}
+
+// The text of a def's type and of its checked term, once a file.
+const DROP_TEXT = new WeakMap<Bend.Def, [string, string]>();
+
+function drop_text(d: Bend.Def): [string, string] {
+  const json = (x: unknown) => JSON.stringify(x, (j, v) => j === "s"
+    ? undefined : v);
+  return memo(DROP_TEXT, d, () => [json(Bend.term_lower(d.T)), json(d.e)]);
+}
+
+function drop_names(text: string, ks: Name[]): boolean {
+  return ks.some((k) => text.includes(`"k":"${k}"`));
+}
+
+function drop_try(T: Name, reach: Name[]): [Drop, Bend.Book] | null {
+  const adt = FL.book.tlds[T];
+  if (adt?.$ !== "ADT" || adt.b || adt.n !== 0 || adt.c.length !== 2
+    || OWNED.includes(T)) {
+    return null;
+  }
+  const [D, P] = adt.c[0].n === 0 ? adt.c : [adt.c[1], adt.c[0]];
+  const doms = ctr_doms(P);
+  if (D.n !== 0 || P.n === 0 || doms.length !== P.n) {
+    return null;
+  }
+  const zs: Bend.LTerm[] = [];
+  for (const F of doms) {
+    const k = ty_adt(F)?.k;
+    if (k !== "U32" && k !== "Nat") {
+      return null;
+    }
+    zs.push(Bend.Lit(k, 0));
+  }
+  const dr: Drop = { T, D: D.k, P: P.k, zs };
+  const book = { ...FL.book, tlds: Object.assign(Object.create(null),
+    FL.book.tlds, { [T]: { ...adt, c: [P] } }) };
+  let built = false;
+  for (const k of reach) {
+    const tld = FL.book.tlds[k];
+    if (tld?.$ !== "Def") {
+      continue;
+    }
+    const [tT, te] = drop_text(tld);
+    if (drop_names(tT, [T, D.k]) && (def_foreign(tld) || k === "main")
+      || drop_names(tT, [D.k])) {
+      return null;
+    }
+    if (!tld.e || !drop_names(te, [D.k])) {
+      continue;
+    }
+    let ok = tld.x === 0;
+    drop_scan(Bend.term_higher(tld.e), T, (m) => {
+      const { arms } = mat_arms(m);
+      const hd = arms.find(([c]) => c === D.k)?.[1];
+      let hp = arms.find(([c]) => c === P.k)?.[1];
+      for (const z of zs) {
+        const l = hp && Bend.term_strip(hp);
+        hp = l?.$ === "Lam" ? l.f(Bend.term_higher(z)) : undefined;
+      }
+      ok &&= hd !== undefined && hp !== undefined && drop_same(hd, hp, dr);
+    });
+    if (!ok) {
+      return null;
+    }
+    built = true;
+    // the def again without D, elaborated against the type alone
+    const def: Bend.Def = { ...tld,
+      v: Bend.term_higher(drop_lt(lt_strip(tld.e), dr)) };
+    try {
+      book.tlds[k] = { ...def, v: null };
+      def.e = Bend.def_check(book, k, def);
+      book.tlds[k] = def;
+    } catch {
+      return null;
+    }
+  }
+  return built ? [dr, book] : null;
+}
+
+function lt_strip(t: any): any {
+  if (t === null || typeof t !== "object") {
+    return t;
+  }
+  if (Array.isArray(t)) {
+    return t.map(lt_strip);
+  }
+  if (t.$ === "Ann") {
+    return lt_strip(t.x);
+  }
+  const o: any = {};
+  for (const k in t) {
+    if (k !== "s" && k !== "c") {
+      o[k] = lt_strip(t[k]);
+    }
+  }
+  return o;
+}
+
+// An unannotated term with D{} built as P{0, ..} and D's arms gone.
+function drop_lt(t: any, dr: Drop): any {
+  if (t === null || typeof t !== "object") {
+    return t;
+  }
+  if (Array.isArray(t)) {
+    return t.map((x) => drop_lt(x, dr));
+  }
+  if (t.$ === "Ctr" && t.k === dr.D) {
+    return Bend.Ctr(dr.P, dr.zs);
+  }
+  if (t.$ === "Mat" && t.k === dr.D) {
+    return drop_lt(t.m, dr);
+  }
+  const o: any = {};
+  for (const k in t) {
+    o[k] = drop_lt(t[k], dr);
+  }
+  return o;
+}
+
+// The defs main reaches, by the names their checked terms call.
+function drop_reach(roots: Name[]): Name[] {
+  const seen = new Set<Name>();
+  const todo = [...roots];
+  const scan = (x: any): void => {
+    if (x === null || typeof x !== "object") {
+      return;
+    }
+    if (Array.isArray(x)) {
+      return x.forEach(scan);
+    }
+    if (x.$ === "Ref" && !seen.has(x.k)) {
+      todo.push(x.k);
+    }
+    // a variable's v is its type; a let's v are its values
+    for (const k in x) {
+      if (k !== "s" && k !== "T" && k !== "c" && (k !== "v" || x.$ === "Let")) {
+        scan(x[k]);
+      }
+    }
+  };
+  while (todo.length > 0) {
+    const k = todo.pop()!;
+    if (!seen.has(k)) {
+      seen.add(k);
+      const tld = FL.book.tlds[k];
+      scan(tld?.$ === "Def" ? tld.e : null);
+    }
+  }
+  return [...seen];
+}
+
+// Flows
+// =====
+
+// A flow is a set of values that can meet: a def's parameter or result, a
+// pattern or let variable, a field of the constructors of another flow,
+// joined by unification over the checked terms of every def main reaches
+// (field by field, so a list's elements and its tails are flows of their
+// own). A flow escapes when a value of it reaches what is not analysed: a
+// foreign def or main's result, a closure or a def used as a value, a `!`
+// call, an intrinsic that takes more than words, a generic field or
+// parameter. Three rewrites follow, each on a flow that does not escape:
+//
+// - a dead flow, whose values nobody matches, reads or passes on to an
+//   escape, is erased: each parameter of it goes from its def and from every
+//   call (an affine value nobody reads may be dropped where it was made);
+// - a live flow of a datatype that builds one constructor, whose fields but
+//   one are dead flows (or never set) and whose other constructors it never
+//   builds, carries that field alone: K{.., x, ..} is x, the match on it is a
+//   lambda, and the positions of the flow take the field's type. Values of
+//   the flow are not stored in another constructor, have no catch-all arm,
+//   and the field is not of the type itself;
+// - a live flow read by one fold alone, on every path, carries the fold's
+//   result (stored folds, below).
+//
+// Every def these touch is written again (unannotated) and elaborated by
+// bend.ts' def_check against its new signature; if one is refused, the
+// one-field rules and then each fold are tried alone, and what checks is
+// kept (a refused rule changes nothing). Nothing is read differently: a dead value had no reader, and the
+// one-field flow's only reader of the wrapper took the field. A dead value
+// is no longer computed, so a program that stopped computing it (the Nat
+// limit, an @unsafe recursion) no longer stops there.
+
+type FNode = { up: number; kids: Map<string, number>; esc: boolean;
+  read: boolean; kid: boolean; ctrs: any[]; mats: any[] };
+
+class Flows {
+  ns: FNode[] = [];
+  mk(): number {
+    return this.ns.push({ up: this.ns.length, kids: new Map(), esc: false,
+      read: false, kid: false, ctrs: [], mats: [] }) - 1;
+  }
+  find(a: number): number {
+    while (this.ns[a].up !== a) {
+      a = this.ns[a].up = this.ns[this.ns[a].up].up;
+    }
+    return a;
+  }
+  at(a: number): FNode {
+    return this.ns[this.find(a)];
+  }
+  kid(a: number, k: string): number {
+    let c = this.at(a).kids.get(k);
+    if (c === undefined) {
+      c = this.mk();
+      this.ns[c].kid = true;
+      this.at(a).kids.set(k, c);
+    }
+    return c;
+  }
+  join(a: number, b: number): number {
+    const todo: [number, number][] = [[a, b]];
+    while (todo.length > 0) {
+      let [x, y] = todo.pop()!;
+      [x, y] = [this.find(x), this.find(y)];
+      if (x !== y) {
+        const [nx, ny] = [this.ns[x], this.ns[y]];
+        ny.up = x;
+        nx.esc ||= ny.esc;
+        nx.read ||= ny.read;
+        nx.kid ||= ny.kid;
+        nx.ctrs.push(...ny.ctrs);
+        nx.mats.push(...ny.mats);
+        for (const [k, c] of ny.kids) {
+          const d = nx.kids.get(k);
+          d === undefined ? nx.kids.set(k, c) : todo.push([d, c]);
+        }
+      }
+    }
+    return this.find(a);
+  }
+  esc(a: number): number {
+    this.at(a).esc = true;
+    return a;
+  }
+}
+
+// intrinsics on words only: their operands are read, nothing escapes
+function flow_word_op(k: Name): boolean {
+  return /^(U32|Nat|F32|Bool|Char)\./.test(k) && !k.includes("show")
+    && !k.includes("read");
+}
+
+function flow_open(T: HTerm | null): boolean {
+  const t = T && ty_wnf(T);
+  return t === null || t.$ === "Var" || t.$ === "App";
+}
+
+type FSite = { d: Name; t: any; n: number; k?: Name; g?: Name };
+
+function flow_analyse(defs: Name[], es: Map<Name, any>) {
+  const F = new Flows();
+  const pos = new Map<string, number>();
+  const param = (d: Name, j: number) => memo(pos, d + "\0" + j, () => F.mk());
+  const ret = (d: Name) => memo(pos, d + "\0r", () => F.mk());
+  // a def's own parameters (its type may unfold into more, as IO does)
+  const doms = (d: Name) => tele_unbind((tld_of(d) as Bend.Def).T).doms
+    .slice(0, (tld_of(d) as Bend.Def).n);
+  const calls: FSite[] = [];
+  const lets: { d: Name; t: any; ns: number[] }[] = [];
+  for (const d of defs) {
+    const tld = tld_of(d) as Bend.Def;
+    doms(d).forEach(([, , A], j) => {
+      if (flow_open(A) && !ty_tag(ty_wnf(A), "Typ Qnt")) {
+        F.esc(param(d, j));
+      }
+      if (def_foreign(tld)) {
+        F.esc(param(d, j));
+      }
+    });
+    if (def_foreign(tld) || d === "main") {
+      F.esc(ret(d));
+    }
+  }
+  const open = new Map<string, boolean>();
+  const fld = (n: number, k: Name, i: number) => {
+    const c = F.kid(n, k + "#" + i);
+    if (memo(open, k + "#" + i, () => flow_open(ctr_doms(FL.book.ctrs[k])[i]
+      ?? null))) {
+      F.esc(c);
+    }
+    return c;
+  };
+  const expr = (d: Name, t: any, env: number[]): number => {
+    switch (t.$) {
+      case "Ann": {
+        return expr(d, t.x, env);
+      }
+      case "Var": {
+        return env[t.i] ?? F.esc(F.mk());
+      }
+      case "Ctr": {
+        const n = F.mk();
+        const ctr = FL.book.ctrs[t.k];
+        F.ns[n].ctrs.push({ d, t, n, k: t.k });
+        const ds = ctr ? ctr_tail(ctr) : [];
+        let i = 0;
+        t.x.forEach((x: any, j: number) => {
+          const e = expr(d, x, env);
+          if (!ds[j] || dom_live(ds[j])) {
+            F.join(fld(n, t.k, i++), e);
+          }
+        });
+        return n;
+      }
+      case "Let": {
+        const vs = t.v.map((v: any) => expr(d, v, env));
+        lets.push({ d, t, ns: vs });
+        vs.forEach((n: number, j: number) => env[t.i[j]] = n);
+        return expr(d, t.f, env);
+      }
+      case "Rwt": {
+        return expr(d, t.f, env);
+      }
+      case "App":
+      case "Ref": {
+        const [h, xs] = lt_spine(t);
+        const ns = xs.map((x) => expr(d, x, env));
+        if (h.$ === "Ref" && intr_of(h.k)) {
+          const word = flow_word_op(h.k);
+          ns.forEach((n) => word ? F.at(n).read = true : F.esc(n));
+          return word ? F.mk() : F.esc(F.mk());
+        }
+        const g = h.$ === "Ref" ? tld_of(h.k) : null;
+        if (h.$ === "Ref" && g?.$ === "Def" && xs.length === doms(h.k).length) {
+          ns.forEach((n, j) => F.join(param(h.k, j), n));
+          calls.push({ d, t, n: 0, g: h.k });
+          return h.b ? (ns.forEach((n) => F.esc(n)), F.esc(ret(h.k))) : ret(h.k);
+        }
+        if (h.$ === "Ref" && g?.$ === "Def") {
+          doms(h.k).forEach((_, j) => F.esc(param(h.k, j)));
+          F.esc(ret(h.k));
+        }
+        ns.forEach((n) => F.esc(n));
+        if (h.$ !== "Ref") {
+          F.esc(expr(d, h, env));
+        }
+        return F.esc(F.mk());
+      }
+      case "Lam":
+      case "Mat": {
+        skel(d, t, [F.esc(F.mk())], env, F.esc(F.mk()));
+        return F.esc(F.mk());
+      }
+      default: {
+        return F.mk();
+      }
+    }
+  };
+  // binders are depths: a deeper one overwrites, a sibling sets its own
+  const skel = (d: Name, t: any, pend: number[], env: number[],
+    out: number): void => {
+    if (t.$ === "Ann") {
+      return skel(d, t.x, pend, env, out);
+    }
+    if (t.$ === "Lam" && pend.length > 0) {
+      env[t.i] = pend[0];
+      return skel(d, t.f, pend.slice(1), env, out);
+    }
+    if (t.$ === "Mat" && pend.length > 0) {
+      const sc = pend[0];
+      F.at(sc).read = true;
+      F.at(sc).mats.push({ d, t, n: sc });
+      const n = FL.book.ctrs[t.k]?.n ?? 0;
+      const fs = [...Array(n).keys()].map((i) => fld(sc, t.k, i));
+      skel(d, t.h, [...fs, ...pend.slice(1)], env, out);
+      return skel(d, t.m, pend, env, out);
+    }
+    if (t.$ === "Efq") {
+      return;
+    }
+    F.join(out, expr(d, t, env));
+    pend.forEach((n) => F.esc(n));
+  };
+  for (const d of defs) {
+    const tld = tld_of(d) as Bend.Def;
+    if (tld.e && !def_foreign(tld)) {
+      es.set(d, tld.e);
+      skel(d, tld.e, doms(d).map((_, j) => param(d, j)), [], ret(d));
+    }
+  }
+  return { F, param, ret, calls, doms, lets };
+}
+
+function flow_book(roots: Name[]): void {
+  if (FL.js || FLOWED.has(FL)) {
+    return;
+  }
+  FLOWED.add(FL);
+  const defs = drop_reach(roots).filter((k) => tld_of(k)?.$ === "Def");
+  const es = new Map<Name, any>();
+  const { F, param, ret, calls, doms, lets } = flow_analyse(defs, es);
+  const root = (n: number) => F.find(n);
+  const dead = (n: number | undefined) => n === undefined
+    || !F.at(n).read && !F.at(n).esc;
+  // the live flows that carry one field
+  const one = new Map<number, [Name, number, number]>();
+  for (let r = 0; r < F.ns.length; r++) {
+    const n = F.ns[r];
+    if (F.find(r) !== r || n.esc || n.kid || n.ctrs.length === 0
+      || !n.read || n.mats.length === 0) {
+      continue;
+    }
+    const ks = new Set(n.ctrs.map((c) => c.k as Name));
+    const T = FL.book.ctrs[[...ks][0]]?.f;
+    const adt = FL.book.tlds[T];
+    if (ks.size !== 1 || adt?.$ !== "ADT" || OWNED.includes(T)
+      || n.mats.some((m) => FL.book.ctrs[m.t.k]?.f !== T)) {
+      continue;
+    }
+    const k = [...ks][0];
+    const live = [...Array(FL.book.ctrs[k].n).keys()].filter((i) =>
+      !dead(n.kids.get(k + "#" + i)));
+    if (live.length !== 1 || adt.c.length < 1) {
+      continue;
+    }
+    const kf = n.kids.get(k + "#" + live[0]);
+    const FT = ctr_doms(FL.book.ctrs[k])[live[0]];
+    // no catch-all arm, the field not of the type itself
+    const rest = (t: any): any => t.$ === "Ann" ? rest(t.x) : t;
+    if (n.mats.some((m) => !["Mat", "Efq"].includes(rest(m.t.m).$))
+      || ty_adt(FT)?.k === T || kf === undefined) {
+      continue;
+    }
+    one.set(r, [k, live[0], n.ctrs.length]);
+  }
+  // a flow both rules take keeps #2223's
+  const folds = flow_folds(F, defs, es, param, ret, lets, doms);
+  one.forEach((_, r) => folds.delete(r));
+  if (one.size === 0 && folds.size === 0) {
+    return;
+  }
+  // the rewrite with these flows: the new book, or null if a def does not
+  // check again
+  const attempt = (one: Map<number, [Name, number, number]>,
+    folds: Map<number, FFold>): Bend.Book | null => {
+    // the dead flows erased: those stored only in fields the one-field flows drop
+    const gone = new Set<number>();
+    for (const [r, [k, i]] of one) {
+      const kids = F.ns[r].kids;
+      for (const [s, c] of kids) {
+        if (s !== k + "#" + i && dead(c)) {
+          gone.add(root(c));
+        }
+      }
+    }
+    // a parameter is erased if its flow is; a def's new signature
+    const sig = new Map<Name, { drop: Set<number>; ty: Map<number | "r", HTerm> }>();
+    const sigOf = (d: Name) => memo(sig, d, () => ({ drop: new Set<number>(),
+      ty: new Map<number | "r", HTerm>() }));
+    // the field's type at a position, the type's arguments there filled in
+    const unwrap = (n: number, A: HTerm): HTerm | null => {
+      const fo = folds.get(root(n));
+      if (fo) {
+        return fo.R;
+      }
+      const o = one.get(root(n));
+      const t = o && ty_adt(A);
+      return t ? ctr_doms(FL.book.ctrs[o[0]], t.x)[o[1]] : null;
+    };
+    const fdefs = new Set([...folds.values()].map((f) => f.f));
+    for (const d of defs) {
+      // a def whose result is erased is only called where its call goes too;
+      // a fold stored is no longer called
+      if (gone.has(root(ret(d))) || fdefs.has(d)) {
+        continue;
+      }
+      doms(d).forEach(([, , A], j) => {
+        const n = param(d, j);
+        const u = unwrap(n, A);
+        if (gone.has(root(n))) {
+          sigOf(d).drop.add(j);
+        } else if (u) {
+          sigOf(d).ty.set(j, u);
+        }
+      });
+      const tld = tld_of(d) as Bend.Def;
+      const u = unwrap(ret(d), tele_fill(tld.T, Array(tld.n).fill(DUMMY)));
+      if (u) {
+        sigOf(d).ty.set("r", u);
+      }
+    }
+    // the sites rewritten, by object
+    const ctrAt = new Map<any, [Name, number]>();
+    const matAt = new Map<any, [Name, number]>();
+    for (const [r, [k, i]] of one) {
+      F.ns[r].ctrs.forEach((c) => ctrAt.set(c.t, [k, i]));
+      F.ns[r].mats.forEach((m) => matAt.set(m.t, [k, i]));
+    }
+    const ctrFold = new Map<any, FFold>();
+    for (const [r, fo] of folds) {
+      F.ns[r].ctrs.forEach((c) => ctrFold.set(c.t, fo));
+    }
+    const touched = new Set<Name>(sig.keys());
+    for (const r of [...one.keys(), ...folds.keys()]) {
+      F.ns[r].ctrs.forEach((c) => touched.add(c.d));
+      F.ns[r].mats.forEach((m) => touched.add(m.d));
+    }
+    // a caller's annotations name the callee's old types: it is elaborated again
+    calls.filter((c) => sig.has(c.g!)).forEach((c) => touched.add(c.d));
+    fdefs.forEach((f) => touched.delete(f));
+    const book = { ...FL.book, tlds: Object.assign(Object.create(null),
+      FL.book.tlds) };
+    const out: Record<Name, Bend.Def> = {};
+    for (const d of touched) {
+      const tld = tld_of(d) as Bend.Def;
+      const s = sig.get(d);
+      if (!tld.e || tld.x > 0 || def_foreign(tld)) {
+        return null;
+      }
+      const ds = doms(d);
+      if (ds.some(([, , A]) => !drop_closed(A))) {
+        return null;
+      }
+      // the new type, over the old one's binders
+      const ty = (t: HTerm, j: number): HTerm => {
+        if (j === ds.length) {
+          return s?.ty.get("r") ?? t;
+        }
+        const a = ty_all(t);
+        return s?.drop.has(j) ? ty(a.B(DUMMY), j + 1)
+          : Bend.All(a.q, a.k, 0, s?.ty.get(j) ?? a.A, (x: HTerm) => ty(a.B(x), j + 1));
+      };
+      const T = ty(tld.T, 0);
+      const e = flow_lt(es.get(d), ds.length, s?.drop ?? new Set(), ctrAt,
+        matAt, sig, ctrFold, fdefs);
+      if (e === null) {
+        return null;
+      }
+      out[d] = { ...tld, T, n: tld.n - (s?.drop.size ?? 0),
+        v: Bend.term_higher(e), e };
+      book.tlds[d] = out[d];
+    }
+    for (const d of Object.keys(out)) {
+      const def = { ...out[d] };
+      try {
+        def.e = Bend.def_check(book, d, def);
+      } catch {
+        return null;
+      }
+      book.tlds[d] = def;
+    }
+    return book;
+  };
+  let book = attempt(one, folds);
+  if (book === null && folds.size > 0) {
+    // one at a time: the one-field flows together, then each fold
+    const o = attempt(one, new Map()) ? one : new Map();
+    const fs = new Map<number, FFold>();
+    for (const [r, fo] of folds) {
+      if (attempt(o, new Map([...fs, [r, fo]]))) {
+        fs.set(r, fo);
+      }
+    }
+    book = o.size + fs.size > 0 ? attempt(o, fs) : null;
+  }
+  if (book === null) {
+    return;
+  }
+  FL.book = book;
+  for (const m of [FL.lays, FL.nodes, FL.holds, FL.hold, FL.funs,
+    FL.teles]) {
+    m.clear();
+  }
+}
+
+const FLOWED = new WeakSet<object>();
+
+// Stored folds. A flow whose only consumer is a fold f (a total def of one
+// parameter, the structure, with no catch-all arm, whose every arm passes
+// each recursive field to f once, on every path), whose values are stored in
+// no other flow and are consumed on every path (each parameter of the flow
+// read in every arm of its def, each let of it read), carries f's result
+// instead: each constructor site is f's arm for it, the fields bound by lets
+// (a recursive field's call to f being the field itself), and each call to
+// f is its argument. f's work then happens when a node is built rather than
+// when it is read; every path reads it, so only the point at which a program
+// stops can move (the owner's ruling). Two recursive fields given the same
+// word-typed term are computed once (the producer fact Node{x, x}). A type
+// that is not recursive is a fold too (an enumeration read by its code). A
+// flow the one-field rule takes is left to it.
+let FOLD_LEVEL = 1 << 20;
+type FFold = { f: Name; R: HTerm; arms: Map<Name, { ls: number[];
+  body: any; rec: Set<number>; tys: HTerm[] }> };
+
+function flow_folds(F: Flows, defs: Name[], es: Map<Name, any>,
+  param: (d: Name, j: number) => number, ret: (d: Name) => number,
+  lets: { d: Name; t: any; ns: number[] }[],
+  doms: (d: Name) => Dom[]): Map<number, FFold> {
+  const out = new Map<number, FFold>();
+  const strip = (t: any): any => t?.$ === "Ann" ? strip(t.x) : t;
+  // the flows stored in a field of another flow
+  const stored = new Set<number>();
+  F.ns.forEach((n, p) => {
+    if (F.find(p) === p) {
+      n.kids.forEach((c) => F.find(c) !== p && stored.add(F.find(c)));
+    }
+  });
+  for (let r = 0; r < F.ns.length; r++) {
+    const n = F.ns[r];
+    if (F.find(r) !== r || n.esc || stored.has(r) || n.ctrs.length === 0
+      || n.mats.length === 0) {
+      continue;
+    }
+    const T = FL.book.ctrs[n.ctrs[0].k]?.f;
+    const adt = FL.book.tlds[T];
+    const f = n.mats[0].d;
+    const tf = tld_of(f) as Bend.Def;
+    if (adt?.$ !== "ADT" || OWNED.includes(T) || adt.n !== 0
+      || n.ctrs.some((c) => FL.book.ctrs[c.k]?.f !== T)
+      || n.mats.some((m) => m.d !== f || FL.book.ctrs[m.t.k]?.f !== T)
+      || tf.n !== 1 || tf.u || tf.x > 0 || !es.has(f)) {
+      continue;
+    }
+    const R = tele_fill(tf.T, [DUMMY]);
+    if (!drop_closed(R) || ty_adt(R)?.k === T) {
+      continue;
+    }
+    // f's body: one match chain on its parameter, an arm per constructor
+    const arms = new Map<Name, { ls: number[]; body: any; rec: Set<number>;
+      tys: HTerm[] }>();
+    let m = strip(es.get(f));
+    let ok = true;
+    const chain = new Set<any>();
+    for (; m?.$ === "Mat"; m = strip(m.m)) {
+      chain.add(m);
+      const ctr = FL.book.ctrs[m.k];
+      const fs = ctr_doms(ctr);
+      const ls: number[] = [];
+      let b = strip(m.h);
+      for (let i = 0; i < ctr.n; i++, b = strip(b.f)) {
+        if (b?.$ !== "Lam") {
+          ok = false;
+          break;
+        }
+        ls.push(b.i);
+      }
+      if (!ok) {
+        break;
+      }
+      const rec = new Set(ls.filter((_, i) => ty_adt(fs[i] ?? null)?.k === T));
+      // the fields' types, a recursive one now f's result
+      const tys = ls.map((l, i) => rec.has(l) ? R : fs[i]);
+      ok &&= tys.every((x) => x !== undefined && drop_closed(x));
+      // each recursive field read once, as f's argument
+      for (const l of rec) {
+        let uses = 0;
+        let calls = 0;
+        const scan = (x: any): void => {
+          if (x === null || typeof x !== "object") {
+            return;
+          }
+          if (Array.isArray(x)) {
+            return x.forEach(scan);
+          }
+          if (x.$ === "Var" && x.i === l) {
+            uses++;
+          }
+          if (x.$ === "App") {
+            const [h, xs] = lt_spine(x);
+            if (h.$ === "Ref" && h.k === f && xs.length === 1
+              && strip(xs[0])?.$ === "Var" && strip(xs[0]).i === l) {
+              calls++;
+            }
+          }
+          for (const k in x) {
+            if (k !== "s" && k !== "c" && k !== "T") {
+              scan(x[k]);
+            }
+          }
+        };
+        scan(b);
+        ok &&= uses === 1 && calls === 1 && flow_strict(b, f, l);
+      }
+      // f called on nothing else, no node of the flow built in an arm
+      let refs = 0;
+      const look = (x: any): void => {
+        if (x === null || typeof x !== "object") {
+          return;
+        }
+        if (Array.isArray(x)) {
+          return x.forEach(look);
+        }
+        refs += Number(x.$ === "Ref" && x.k === f);
+        ok &&= !(x.$ === "Ctr" && FL.book.ctrs[x.k]?.f === T);
+        for (const k in x) {
+          if (k !== "s" && k !== "c" && k !== "T") {
+            look(x[k]);
+          }
+        }
+      };
+      look(b);
+      ok &&= refs === rec.size;
+      arms.set(m.k, { ls, body: b, rec, tys });
+    }
+    if (!ok || m?.$ !== "Efq" || n.mats.some((x) => !chain.has(x.t))
+      || n.ctrs.some((c) => !arms.has(c.k))) {
+      continue;
+    }
+    // every value consumed on every path
+    const inR = (x: number) => F.find(x) === r;
+    if (lets.some((l) => l.ns.some((x, j) => inR(x)
+      && !lt_every(strip(l.t).f, (y) => y.$ === "Var" && y.i === l.t.i[j])))) {
+      continue;
+    }
+    if (defs.some((d) => d !== f && es.has(d) && doms(d).some((_, j) =>
+      inR(param(d, j)) && !flow_everywhere(es.get(d), doms(d).length, j)))) {
+      continue;
+    }
+    out.set(r, { f, R, arms });
+  }
+  return out;
+}
+
+// Whether every path through t evaluates a node hit accepts: reached
+// through no lambda that is not a match arm, and through every arm of a
+// match (Bend evaluates arguments and let values before their use).
+function lt_every(t: any, hit: (x: any) => boolean): boolean {
+  const arms = (h: any): boolean => h.$ === "Ann" ? arms(h.x)
+    : h.$ === "Lam" ? arms(h.f) : go(h);
+  const go = (x: any): boolean => {
+    if (x === null || typeof x !== "object") {
+      return false;
+    }
+    if (hit(x)) {
+      return true;
+    }
+    switch (x.$) {
+      case "Ann":
+        return go(x.x);
+      case "Let":
+        return x.v.some(go) || go(x.f);
+      case "Ctr":
+        return x.x.some(go);
+      case "App": {
+        const [h, xs] = lt_spine(x);
+        if (xs.some(go)) {
+          return true;
+        }
+        // a match applied: every arm, its fields' lambdas opened
+        let m = h;
+        if (m.$ !== "Mat") {
+          return go(h);
+        }
+        for (; m.$ === "Mat"; m = m.m.$ === "Ann" ? m.m.x : m.m) {
+          if (!arms(m.h)) {
+            return false;
+          }
+        }
+        return m.$ === "Efq" || arms(m);
+      }
+      default:
+        return false;
+    }
+  };
+  return go(t);
+}
+
+// Whether f(l) is evaluated on every path through an arm body.
+function flow_strict(b: any, f: Name, l: number): boolean {
+  const strip = (t: any): any => t?.$ === "Ann" ? strip(t.x) : t;
+  return lt_every(b, (x) => {
+    if (x.$ !== "App") {
+      return false;
+    }
+    const [h, xs] = lt_spine(x);
+    return h.$ === "Ref" && h.k === f && xs.length === 1
+      && strip(xs[0]).$ === "Var" && strip(xs[0]).i === l;
+  });
+}
+
+// Whether parameter j is read in every arm of a def's case tree.
+function flow_everywhere(e: any, n: number, j: number): boolean {
+  let ok = true;
+  const walk = (t: any, pend: (number | null)[], at: number | null): void => {
+    if (t.$ === "Ann") {
+      return walk(t.x, pend, at);
+    }
+    if (pend.length > 0 && t.$ === "Lam") {
+      return walk(t.f, pend.slice(1), pend[0] === j ? t.i : at);
+    }
+    if (pend.length > 0 && t.$ === "Mat") {
+      if (pend[0] === j) {
+        return;
+      }
+      const k = FL.book.ctrs[t.k]?.n ?? 0;
+      walk(t.h, [...Array(k).fill(null), ...pend.slice(1)], at);
+      return walk(t.m, pend, at);
+    }
+    if (t.$ === "Efq") {
+      return;
+    }
+    ok &&= at !== null && lt_every(t, (x) => x.$ === "Var" && x.i === at);
+  };
+  walk(e, [...Array(n).keys()], null);
+  return ok;
+}
+
+// A constructor site of a stored fold: the fold's arm, its fields bound.
+function flow_fold_site(t: any, fo: FFold, go: (x: any) => any): any {
+  const arm = fo.arms.get(t.k)!;
+  const xs = t.x.filter((_: any, j: number) => {
+    const ds = ctr_tail(FL.book.ctrs[t.k]);
+    return !ds[j] || dom_live(ds[j]);
+  });
+  // f's binders get levels of their own in the def the site is in
+  const lv = new Map<number, number>();
+  const fresh = (l: number) => lv.get(l) ?? (lv.set(l, FOLD_LEVEL++), lv.get(l)!);
+  arm.ls.forEach(fresh);
+  const relevel = (x: any): any => {
+    if (x === null || typeof x !== "object") {
+      return x;
+    }
+    if (Array.isArray(x)) {
+      return x.map(relevel);
+    }
+    const o: any = {};
+    for (const k in x) {
+      o[k] = x.$ === "Var" && k === "v" ? x[k] : relevel(x[k]);
+    }
+    if (x.$ === "Var") {
+      o.i = x.i >= 0 && x.v === undefined ? fresh(x.i) : x.i;
+    } else if (typeof x.i === "number") {
+      o.i = fresh(x.i);
+    } else if (x.$ === "Let") {
+      o.i = x.i.map(fresh);
+    }
+    return o;
+  };
+  // the arm's body as the def's own are rewritten: f's calls (on a
+  // recursive field) the field itself
+  let b = relevel(go(arm.body));
+  const ls = arm.ls.map(fresh);
+  const rec = new Set([...arm.rec].map(fresh));
+  // two recursive fields given the same term: one let
+  const vals = xs.map((x: any) => go(x));
+  // a term's key; none (no copy) for one with cyclic substitutions
+  let n = 0;
+  const key = (x: any) => {
+    try {
+      return JSON.stringify(x);
+    } catch {
+      return String(n++) + "\0";
+    }
+  };
+  const R = ty_adt(fo.R);
+  const word = R !== null && !lay_of(fo.R).ks.includes("box");
+  const alias = new Map<number, number>();
+  ls.forEach((l, i) => ls.forEach((l2, i2) => {
+    if (i2 < i && word && rec.has(l) && rec.has(l2) && !alias.has(l2)
+      && !alias.has(l) && key(vals[i]) === key(vals[i2])) {
+      alias.set(l, l2);
+    }
+  }));
+  const rename = (x: any): any => x === null || typeof x !== "object" ? x
+    : Array.isArray(x) ? x.map(rename) : x.$ === "Var" && alias.has(x.i)
+      ? { ...x, i: alias.get(x.i) } : Object.fromEntries(Object.entries(x)
+        .map(([k, v]) => [k, rename(v)]));
+  b = rename(b);
+  for (let i = ls.length - 1; i >= 0; i--) {
+    const l = ls[i];
+    if (alias.has(l)) {
+      continue;
+    }
+    let uses = 0;
+    const scan = (x: any): void => {
+      if (x === null || typeof x !== "object") {
+        return;
+      }
+      if (Array.isArray(x)) {
+        return x.forEach(scan);
+      }
+      uses += Number(x.$ === "Var" && x.i === l);
+      for (const k in x) {
+        if (k !== "T" && k !== "s" && k !== "c") {
+          scan(x[k]);
+        }
+      }
+    };
+    scan(b);
+    b = { $: "Let", k: ["x" + i], i: [l], q: [uses > 1 ? Bend.Many() : Bend.Lone()],
+      v: [{ $: "Ann", x: vals[i], T: Bend.term_lower(arm.tys[i]) }], f: b };
+  }
+  return b;
+}
+
+// Whether a type names no variable (a parameter's type that names an earlier
+// parameter is left as it is).
+function drop_closed(T: HTerm): boolean {
+  return !/"\$":"Var","k":"[^"]*","i":[0-9]/.test(JSON.stringify(
+    Bend.term_lower(T, 1 << 29), (j, v) => j === "s" || j === "c" ? undefined
+      : v));
+}
+
+// A def's stripped term rewritten: the erased parameters' binders and
+// arguments gone, the one-field flows' constructors their field and their
+// matches lambdas. Null if a dropped binder is still read (checked in its
+// own scope: a binder's index is its depth, which other arms reuse).
+function flow_lt(e: any, n: number, drop: Set<number>,
+  ctrAt: Map<any, [Name, number]>, matAt: Map<any, [Name, number]>,
+  sig: Map<Name, { drop: Set<number> }>, ctrFold: Map<any, FFold>,
+  fdefs: Set<Name>): any {
+  let bad = false;
+  // the term comes out unannotated, for def_check to elaborate again
+  const go = (t: any): any => {
+    if (t === null || typeof t !== "object") {
+      return t;
+    }
+    if (Array.isArray(t)) {
+      return t.map(go);
+    }
+    if (t.$ === "Ann") {
+      return go(t.x);
+    }
+    if (ctrAt.has(t)) {
+      return go(t.x[ctr_live_at(t.k, ctrAt.get(t)![1])]);
+    }
+    if (ctrFold.has(t)) {
+      return flow_fold_site(t, ctrFold.get(t)!, go);
+    }
+    if (t.$ === "App" || t.$ === "Ref") {
+      const [h, xs] = lt_spine(t);
+      if (h.$ === "Ref" && fdefs.has(h.k) && xs.length === 1) {
+        return go(xs[0]);
+      }
+      const dr = h.$ === "Ref" ? sig.get(h.k)?.drop : undefined;
+      if (dr && dr.size > 0) {
+        return xs.filter((_, j) => !dr.has(j)).reduce((f: any, x) =>
+          ({ $: "App", f, x: go(x) }), h);
+      }
+    }
+    const o: any = {};
+    for (const k in t) {
+      if (k !== "s" && k !== "c") {
+        o[k] = go(t[k]);
+      }
+    }
+    return o;
+  };
+  // the case tree: pend holds, per binder still to come, its parameter's
+  // index (null for a field)
+  const walk = (t: any, pend: (number | null)[]): any => {
+    if (pend.length === 0) {
+      return go(t);
+    }
+    if (t.$ === "Ann") {
+      return walk(t.x, pend);
+    }
+    if (t.$ === "Lam") {
+      if (pend[0] !== null && drop.has(pend[0])) {
+        const b = walk(t.f, pend.slice(1));
+        bad ||= lt_reads(b, new Set([t.i]));
+        return b;
+      }
+      return { ...t, f: walk(t.f, pend.slice(1)) };
+    }
+    if (t.$ === "Mat") {
+      const at = matAt.get(t);
+      if (at && t.k !== at[0]) {
+        return walk(t.m, pend);
+      }
+      if (at) {
+        const drops = new Set<number>();
+        const l = flow_arm(t.h, FL.book.ctrs[t.k].n, at[1], drops);
+        if (l.$ !== "Lam") {
+          bad = true;
+          return l;
+        }
+        const b = walk(l.f, pend.slice(1));
+        bad ||= lt_reads(b, drops);
+        return { ...l, f: b };
+      }
+      const k = FL.book.ctrs[t.k]?.n ?? 0;
+      return { ...t, h: walk(t.h, [...Array(k).fill(null), ...pend.slice(1)]),
+        m: walk(t.m, pend) };
+    }
+    return go(t);
+  };
+  const body = walk(e, [...Array(n).keys()]);
+  return bad ? null : body;
+}
+
+// The arm of a one-field match as a lambda of the field alone.
+function flow_arm(h: any, n: number, i: number, gone: Set<number>): any {
+  const binders: any[] = [];
+  let b = h;
+  for (let j = 0; j < n; j++) {
+    while (b?.$ === "Ann") {
+      b = b.x;
+    }
+    if (b?.$ !== "Lam") {
+      return { $: "Efq" };
+    }
+    binders.push(b);
+    b = b.f;
+  }
+  binders.forEach((l, j) => j !== i && gone.add(l.i));
+  return { ...binders[i], f: b };
+}
+
+function ctr_live_at(k: Name, i: number): number {
+  const ds = ctr_tail(FL.book.ctrs[k]);
+  let live = -1;
+  for (let j = 0; j < ds.length; j++) {
+    if (!ds[j] || dom_live(ds[j])) {
+      live++;
+    }
+    if (live === i) {
+      return j;
+    }
+  }
+  return i;
+}
+
+function lt_reads(t: any, vs: Set<number>): boolean {
+  if (vs.size === 0 || t === null || typeof t !== "object") {
+    return false;
+  }
+  if (Array.isArray(t)) {
+    return t.some((x) => lt_reads(x, vs));
+  }
+  if (t.$ === "Var" && vs.has(t.i)) {
+    return true;
+  }
+  for (const k in t) {
+    if (k !== "T" && k !== "s" && k !== "c" && lt_reads(t[k], vs)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// a call's head and arguments, through annotations
+function lt_spine(t: any): [any, any[]] {
+  const xs: any[] = [];
+  while (t.$ === "App" || t.$ === "Ann") {
+    if (t.$ === "App") {
+      xs.unshift(t.x);
+    }
+    t = t.$ === "App" ? t.f : t.x;
+  }
+  return [t, xs];
+}
+
+// Before any def is opened, once a file (file_book may run again for the
+// defs a pass made): each type whose default drops, and the book with its
+// one constructor and its rewritten defs; then the caches a layout or a body
+// went into are emptied.
+const DROPPED = new WeakSet<object>();
+
+function drop_book(roots: Name[]): void {
+  if (FL.js || DROPPED.has(FL)) {
+    return;
+  }
+  DROPPED.add(FL);
+  const reach = drop_reach(roots);
+  const book = FL.book;
+  for (const T of Object.keys(FL.book.tlds)) {
+    const got = drop_try(T, reach);
+    if (got !== null) {
+      FL.book = got[1];
+    }
+  }
+  if (FL.book !== book) {
+    for (const m of [FL.lays, FL.nodes, FL.holds, FL.hold, FL.funs]) {
+      m.clear();
+    }
+  }
+}
+
 // Io
 // ==
 
@@ -1635,6 +2851,8 @@ function file_book(roots: Name[]): void {
         + " names both a constructor and a foreign def: name one apart");
     }
   }
+  drop_book(roots);
+  flow_book(roots);
   roots.forEach(src_add);
   const own = new Set<Name>();
   for (const d of FL.srcs.keys()) {
