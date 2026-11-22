@@ -1,12 +1,11 @@
 # stored folds: a tree read only by one fold, on every path, carries the
 # fold's result instead. sum1 and cnt2 change: their trees are never built,
 # each node is its arm of the fold (mk2's two equal subtrees computed once).
-# The others are folded on some path only, so their trees stay: a fold on a
-# path not taken (pick3), behind a match in the fold's arm (prod4) or a
-# lambda its arm passes on (prod8), of a tree
-# a let leaves unread (keep5), from a tree passed through generic code
-# (via_gen6), and a tree matched by two defs (two7). Each would overflow a
-# Nat if its fold ran where the program does not run it.
+# The others stay trees, each folded where the program may not fold it: on
+# a path not taken (pick3), behind a match in the fold's arm (prod4) or a
+# lambda its arm passes on (prod8), from a let left unread (keep5), through
+# generic code (via_gen6), and by two defs (two7). Each would overflow a Nat
+# if its fold ran where the program does not run it.
 # Arguments are read at run time, so no call is evaluated by the compiler.
 import Base
 

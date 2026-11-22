@@ -1410,7 +1410,7 @@ function drop_reach(roots: Name[]): Name[] {
 // own). A flow escapes when a value of it reaches what is not analysed: a
 // foreign def or main's result, a closure or a def used as a value, a `!`
 // call, an intrinsic that takes more than words, a generic field or
-// parameter. Two rewrites follow, each on a flow that does not escape:
+// parameter. Three rewrites follow, each on a flow that does not escape:
 //
 // - a dead flow, whose values nobody matches, reads or passes on to an
 //   escape, is erased: each parameter of it goes from its def and from every
@@ -1420,11 +1420,14 @@ function drop_reach(roots: Name[]): Name[] {
 //   builds, carries that field alone: K{.., x, ..} is x, the match on it is a
 //   lambda, and the positions of the flow take the field's type. Values of
 //   the flow are not stored in another constructor, have no catch-all arm,
-//   and the field is not of the type itself.
+//   and the field is not of the type itself;
+// - a live flow read by one fold alone, on every path, carries the fold's
+//   result (stored folds, below).
 //
 // Every def these touch is written again (unannotated) and elaborated by
-// bend.ts' def_check against its new signature; if one is refused, nothing
-// changes. Nothing is read differently: a dead value had no reader, and the
+// bend.ts' def_check against its new signature; if one is refused, the
+// one-field rules and then each fold are tried alone, and what checks is
+// kept (a refused rule changes nothing). Nothing is read differently: a dead value had no reader, and the
 // one-field flow's only reader of the wrapper took the field. A dead value
 // is no longer computed, so a program that stopped computing it (the Nat
 // limit, an @unsafe recursion) no longer stops there.
@@ -1672,7 +1675,9 @@ function flow_book(roots: Name[]): void {
     }
     one.set(r, [k, live[0], n.ctrs.length]);
   }
+  // a flow both rules take keeps #2223's
   const folds = flow_folds(F, defs, es, param, ret, lets, doms);
+  one.forEach((_, r) => folds.delete(r));
   if (one.size === 0 && folds.size === 0) {
     return;
   }
@@ -1812,9 +1817,9 @@ function flow_book(roots: Name[]): void {
 
 const FLOWED = new WeakSet<object>();
 
-// Stored folds. A recursive flow whose only consumer is a fold f (a total
-// def of one parameter, the structure, whose every arm passes each recursive
-// field once to f itself and has no catch-all), whose values are stored in
+// Stored folds. A flow whose only consumer is a fold f (a total def of one
+// parameter, the structure, with no catch-all arm, whose every arm passes
+// each recursive field to f once, on every path), whose values are stored in
 // no other flow and are consumed on every path (each parameter of the flow
 // read in every arm of its def, each let of it read), carries f's result
 // instead: each constructor site is f's arm for it, the fields bound by lets
@@ -1822,7 +1827,9 @@ const FLOWED = new WeakSet<object>();
 // f is its argument. f's work then happens when a node is built rather than
 // when it is read; every path reads it, so only the point at which a program
 // stops can move (the owner's ruling). Two recursive fields given the same
-// word-typed term are computed once (the producer fact Node{x, x}).
+// word-typed term are computed once (the producer fact Node{x, x}). A type
+// that is not recursive is a fold too (an enumeration read by its code). A
+// flow the one-field rule takes is left to it.
 let FOLD_LEVEL = 1 << 20;
 type FFold = { f: Name; R: HTerm; arms: Map<Name, { ls: number[];
   body: any; rec: Set<number>; tys: HTerm[] }> };
@@ -2047,33 +2054,6 @@ function flow_fold_site(t: any, fo: FFold, go: (x: any) => any): any {
     const ds = ctr_tail(FL.book.ctrs[t.k]);
     return !ds[j] || dom_live(ds[j]);
   });
-  // the arm's body, its calls of f on a recursive field the field itself
-  const body = (x: any): any => {
-    if (x === null || typeof x !== "object") {
-      return x;
-    }
-    if (Array.isArray(x)) {
-      return x.map(body);
-    }
-    if (x.$ === "Ann") {
-      return body(x.x);
-    }
-    if (x.$ === "App") {
-      const [h, a] = lt_spine(x);
-      const v = a.length === 1 ? a[0] : null;
-      const vs = v?.$ === "Ann" ? v.x : v;
-      if (h.$ === "Ref" && h.k === fo.f && vs?.$ === "Var" && arm.rec.has(vs.i)) {
-        return { $: "Var", k: vs.k, i: vs.i };
-      }
-    }
-    const o: any = {};
-    for (const k in x) {
-      if (k !== "s" && k !== "c") {
-        o[k] = body(x[k]);
-      }
-    }
-    return o;
-  };
   // f's binders get levels of their own in the def the site is in
   const lv = new Map<number, number>();
   const fresh = (l: number) => lv.get(l) ?? (lv.set(l, FOLD_LEVEL++), lv.get(l)!);
@@ -2087,7 +2067,7 @@ function flow_fold_site(t: any, fo: FFold, go: (x: any) => any): any {
     }
     const o: any = {};
     for (const k in x) {
-      o[k] = relevel(x[k]);
+      o[k] = x.$ === "Var" && k === "v" ? x[k] : relevel(x[k]);
     }
     if (x.$ === "Var") {
       o.i = x.i >= 0 && x.v === undefined ? fresh(x.i) : x.i;
@@ -2098,12 +2078,22 @@ function flow_fold_site(t: any, fo: FFold, go: (x: any) => any): any {
     }
     return o;
   };
-  let b = relevel(body(arm.body));
+  // the arm's body as the def's own are rewritten: f's calls (on a
+  // recursive field) the field itself
+  let b = relevel(go(arm.body));
   const ls = arm.ls.map(fresh);
   const rec = new Set([...arm.rec].map(fresh));
   // two recursive fields given the same term: one let
   const vals = xs.map((x: any) => go(x));
-  const key = (x: any) => JSON.stringify(x);
+  // a term's key; none (no copy) for one with cyclic substitutions
+  let n = 0;
+  const key = (x: any) => {
+    try {
+      return JSON.stringify(x);
+    } catch {
+      return String(n++) + "\0";
+    }
+  };
   const R = ty_adt(fo.R);
   const word = R !== null && !lay_of(fo.R).ks.includes("box");
   const alias = new Map<number, number>();
