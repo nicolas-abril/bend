@@ -1,0 +1,9 @@
+ok             not caught (0 of 60 runs wrong)
+split-newest   CAUGHT (25 of 60 runs wrong) e.g. lazy_split_unbal t2: limit: over 30 s: killed
+no-wait        CAUGHT (26 of 60 runs wrong) e.g. lazy_split_deep t10: 2107116873
+no-drop        CAUGHT (30 of 60 runs wrong) e.g. lazy_split_deep t4: limit: over 5120 MB (held 5353 MB): killed
+future-runs    not caught (0 of 60 runs wrong)
+result-word    CAUGHT (17 of 60 runs wrong) e.g. lazy_split_unbal t2: 2762828544
+no-reclaim     CAUGHT (14 of 60 runs wrong) e.g. lazy_split_unbal t10: limit: over 30 s: killed
+steal-no-cas   CAUGHT (30 of 60 runs wrong) e.g. lazy_split_deep t4: 3369088614
+early-done     not caught (0 of 60 runs wrong)

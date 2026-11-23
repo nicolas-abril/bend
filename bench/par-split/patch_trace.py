@@ -57,8 +57,8 @@ __attribute__((constructor)) static void tr_init(void) { tr_t_start = tr_tick();
 
 EDITS = [
     ("#define ring_word(H, r, w)", HEAD + "\n#define ring_word(H, r, w)"),
-    ("    Term r = work_loop(e, stk, t, seq);\n",
-     "    TR_BEGIN\n    u32 tr_fid = term_aux(t);\n    Term r = work_loop(e, stk, t, seq);\n"
+    ("re:(    Term r = work_loop\\(e, stk, t, seq(?: \\? 1 \\| FK_ON\\(e\\) : 0)?\\);\n)",
+     "    TR_BEGIN\n    u32 tr_fid = term_aux(t);\n\\1"
      "    TR_END(TR_W(e), 0, (u16)((seq != 0) | ((r == 0 ? 0 : (u32)H[task_tail(r) + 1] != 0 ? 1 : 2) << 1) | (TR_PCORE << 3) | ((tr_fid & 0xFFF) << 4)));\n"),
     ("OUTLINE void pool_turn(bool grow, u32 rows) {\n", "OUTLINE void pool_turn(bool grow, u32 rows) {\n  TR_BEGIN\n"),
     ("  POOL_WAIT(a32_load_acq(&pool_done) != 0, pool_join)\n", "  POOL_WAIT(a32_load_acq(&pool_done) != 0, pool_join)\n  TR_END(0, grow ? 1 : 2, (u16)rows);\n"),
@@ -68,8 +68,12 @@ EDITS = [
 
 if __name__ == "__main__":
     s = open(sys.argv[1]).read()
+    import re
     for pat, rep in EDITS:
-        if s.count(pat) != 1:
-            raise SystemExit(f"patch_trace: {pat[:60]!r} matched {s.count(pat)} times")
-        s = s.replace(pat, rep)
+        if pat.startswith("re:"):
+            s, n = re.subn(pat[3:], rep, s)
+        else:
+            n = s.count(pat); s = s.replace(pat, rep)
+        if n != 1:
+            raise SystemExit(f"patch_trace: {pat[:60]!r} matched {n} times")
     open(sys.argv[2], "w").write(s)
