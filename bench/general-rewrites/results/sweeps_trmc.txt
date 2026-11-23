@@ -1,0 +1,70 @@
+== osprey__digitsum__bend-par__digitsum
+| variant | instructions G | P-core cycles G least / median / most | raw cycles G least / median | P-core % | runs | output |
+|---|---:|---|---:|---:|---|
+| int | 0.137 | 0.025 / 0.027 / 0.027 | 0.027 / 0.027 | 100 | 32 | 55000002 |
+| trmc | 0.137 | 0.025 / 0.027 / 0.027 | 0.027 / 0.027 | 100 | 32 | 55000002 |
+== osprey__isqrt__bend-par__isqrt
+| variant | instructions G | P-core cycles G least / median / most | raw cycles G least / median | P-core % | runs | output |
+|---|---:|---|---:|---:|---|
+| int | 0.169 | 0.062 / 0.062 / 0.063 | 0.062 / 0.062 | 100 | 32 | 666167500 |
+| trmc | 0.169 | 0.062 / 0.062 / 0.063 | 0.062 / 0.062 | 100 | 32 | 666167500 |
+== polybench__syr2k__main
+| variant | instructions G | P-core cycles G least / median / most | raw cycles G least / median | P-core % | runs | output |
+|---|---:|---|---:|---:|---|
+| int | 11.606 | 2.009 / 2.097 / 2.229 | 2.037 / 2.118 | 99 | 32 | C 1440000 2418599018 |
+| trmc | 11.606 | 2.018 / 2.124 / 2.223 | 2.037 / 2.133 | 99 | 32 | C 1440000 2418599018 |
+== polybench__covariance__main
+| variant | instructions G | P-core cycles G least / median / most | raw cycles G least / median | P-core % | runs | output |
+|---|---:|---|---:|---:|---|
+| int | 11.148 | 2.789 / 2.939 / 3.120 | 2.790 / 2.951 | 100 | 32 | cov 1440000 2247963150 |
+| trmc | 11.148 | 2.811 / 2.972 / 3.371 | 2.811 / 3.057 | 100 | 32 | cov 1440000 2247963150 |
+== osprey__textstats__bend__textstats
+| variant | instructions G | P-core cycles G least / median / most | raw cycles G least / median | P-core % | runs | output |
+|---|---:|---|---:|---:|---|
+| int | 0.043 | 0.009 / 0.009 / 0.010 | 0.009 / 0.009 | 100 | 32 | 1574956 |
+| trmc | 0.043 | 0.009 / 0.009 / 0.009 | 0.009 / 0.009 | 100 | 32 | 1574956 |
+== osprey__wordfreq__bend__wordfreq
+| variant | instructions G | P-core cycles G least / median / most | raw cycles G least / median | P-core % | runs | output |
+|---|---:|---|---:|---:|---|
+| int | 0.016 | 0.004 / 0.004 / 0.004 | 0.004 / 0.004 | 100 | 32 | 900036 |
+| trmc | 0.016 | 0.004 / 0.004 / 0.004 | 0.004 / 0.004 | 100 | 32 | 900036 |
+== clbg__pidigits__main
+| variant | instructions G | P-core cycles G least / median / most | raw cycles G least / median | P-core % | runs | output |
+|---|---:|---|---:|---:|---|
+| int | 7.326 | 3.370 / 3.489 / 3.678 | 3.371 / 3.483 | 100 | 32 | 9216420198	:1000 |
+| trmc | 7.063 | 2.413 / 2.462 / 2.502 | 2.414 / 2.469 | 100 | 32 | 9216420198	:1000 |
+== perceus__cfold__main
+| variant | instructions G | P-core cycles G least / median / most | raw cycles G least / median | P-core % | runs | output |
+|---|---:|---|---:|---:|---|
+| int | 0.650 | 0.184 / 0.188 / 0.190 | 0.187 / 0.189 | 100 | 32 | 3447966 |
+| trmc | 0.472 | 0.100 / 0.102 / 0.104 | 0.100 / 0.103 | 100 | 32 | 3447966 |
+== perceus__rbtree__main
+| variant | instructions G | P-core cycles G least / median / most | raw cycles G least / median | P-core % | runs | output |
+|---|---:|---|---:|---:|---|
+| int | 9.360 | 2.114 / 2.146 / 2.153 | 2.114 / 2.146 | 100 | 32 | 420000 |
+| trmc | 7.828 | 1.901 / 1.916 / 1.920 | 1.901 / 1.916 | 100 | 32 | 420000 |
+== kostya__primes__main
+| variant | instructions G | P-core cycles G least / median / most | raw cycles G least / median | P-core % | runs | output |
+|---|---:|---|---:|---:|---|
+| int | 9.676 | 3.522 / 3.716 / 3.933 | 3.522 / 3.718 | 100 | 32 | [323381, 323383, 3233803, 3233809, 3233851, 3233863, 3233873, 3233887, 3233897] |
+| trmc | 8.652 | 2.972 / 3.157 / 3.339 | 2.972 / 3.159 | 100 | 32 | [323381, 323383, 3233803, 3233809, 3233851, 3233863, 3233873, 3233887, 3233897] |
+== koka-extra__finger-tree__main
+| variant | instructions G | P-core cycles G least / median / most | raw cycles G least / median | P-core % | runs | output |
+|---|---:|---|---:|---:|---|
+| int | 8.928 | 1.629 / 1.637 / 1.704 | 1.631 / 1.644 | 100 | 32 | total: 10000000 |
+| trmc | 7.931 | 1.381 / 1.390 / 1.461 | 1.384 / 1.392 | 100 | 32 | total: 10000000 |
+== clbg__n-body__main
+| variant | instructions G | P-core cycles G least / median / most | raw cycles G least / median | P-core % | runs | output |
+|---|---:|---|---:|---:|---|
+| int | 9.497 | 2.386 / 2.390 / 2.399 | 2.387 / 2.390 | 100 | 32 | -0.1691 |
+| trmc | 8.777 | 2.182 / 2.186 / 2.197 | 2.182 / 2.186 | 100 | 32 | -0.1691 |
+== koka-extra__rbtree-del__main
+| variant | instructions G | P-core cycles G least / median / most | raw cycles G least / median | P-core % | runs | output |
+|---|---:|---|---:|---:|---|
+| int | 11.565 | 2.732 / 2.786 / 2.830 | 2.732 / 2.787 | 100 | 32 | 294000 |
+| trmc | 10.146 | 2.403 / 2.421 / 2.437 | 2.403 / 2.422 | 100 | 32 | 294000 |
+== respelled__listops__main
+| variant | instructions G | P-core cycles G least / median / most | raw cycles G least / median | P-core % | runs | output |
+|---|---:|---|---:|---:|---|
+| int | 0.013 | 0.003 / 0.004 / 0.004 | 0.003 / 0.004 | 100 | 32 | 15992435 |
+| trmc | 0.013 | 0.003 / 0.004 / 0.004 | 0.003 / 0.004 | 100 | 32 | 15992435 |

@@ -1,0 +1,36 @@
+pal_closures 81149393330 result (1, 999999)
+pal_helpers 3529112669 result (1, 999999)
+sym_base 36394587867 2383953211
+sym_affine 41174054261 2383953211
+bend 2.0.40 is available: run bend update
+bend-runtime_lexer_base 53739204422 2401049475
+bend 2.0.40 is available: run bend update
+bend-runtime_lexer_1810 52434770589 2401049475
+bend 2.0.40 is available: run bend update
+perceus_rbtree_base 21845142967 420000
+bend 2.0.40 is available: run bend update
+perceus_rbtree_1810 19262777565 420000
+bend 2.0.40 is available: run bend update
+kostya_json_base 8294109361 x: -5.503e-30, y: 5.498e+30, z: 5.009e-1
+bend 2.0.40 is available: run bend update
+kostya_json_1810 7899222860 x: -5.503e-30, y: 5.498e+30, z: 5.009e-1
+bend 2.0.40 is available: run bend update
+clbg_pidigits_base 11705077463 3141592653	:10
+bend 2.0.40 is available: run bend update
+clbg_pidigits_1810 11707387467 3141592653	:10
+bend 2.0.40 is available: run bend update
+clbg_k-nucleotide_base 21228215498 A 30.298
+bend 2.0.40 is available: run bend update
+clbg_k-nucleotide_1810 21239974410 A 30.298
+bend 2.0.40 is available: run bend update
+awfy_havlak_base 19931844190 loops 6102, basic blocks 5213
+bend 2.0.40 is available: run bend update
+awfy_havlak_1810 19931696040 loops 6102, basic blocks 5213
+bend 2.0.40 is available: run bend update
+koka-extra_msort_base 21260035380 total: -1490400
+bend 2.0.40 is available: run bend update
+koka-extra_msort_1810 21259672716 total: -1490400
+bend 2.0.40 is available: run bend update
+koka-extra_qsort_base 23849908827 total: -1490400
+bend 2.0.40 is available: run bend update
+koka-extra_qsort_1810 23850109666 total: -1490400
