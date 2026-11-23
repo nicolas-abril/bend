@@ -1,0 +1,5 @@
+num rounds 240
+
+to see output, use -output and -resolution arguments
+for example: delaunay -n 1000 -output result.ppm -resolution 1000
+check 2844536146
