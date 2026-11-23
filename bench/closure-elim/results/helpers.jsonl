@@ -1,0 +1,4 @@
+{"prog": "closures/pipeline/helpers.bend", "ok": true, "ins": 677697486, "cyc": 220134854}
+{"prog": "closures/twolevel/helpers.bend", "ok": true, "ins": 1182216751, "cyc": 308206142}
+{"prog": "closures/cps/helpers.bend", "ok": true, "ins": 4353230672, "cyc": 1395853746}
+{"prog": "closures/search/helpers.bend", "ok": true, "ins": 1833188441, "cyc": 444347074}

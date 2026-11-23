@@ -1,0 +1,3 @@
+ran 67
+ran 67
+same 67 differ 0; elim2 statuses {'t1': 67}

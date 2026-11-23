@@ -1,0 +1,7 @@
+key ignores the lambda: CAUGHT by clo_elim.bend, known_callback_edges.bend (build), known_callback_shapes.bend
+captures passed in reverse: CAUGHT by clo_elim.bend (build), clo_elim_generic.bend (build), known_callback_array.bend, known_callback_edges.bend (build), known_callback_shapes.bend
+body kept with its cells: MISSED
+type-only captures passed live: MISSED
+beta binds every argument to the first: CAUGHT by known_callback_edges.bend
+lend without the box test: CAUGHT by record_wide_boxed_params.bend (build)
+erased arguments not filled: CAUGHT by clo_elim_generic.bend (build)
