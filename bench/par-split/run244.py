@@ -15,7 +15,7 @@ names = sorted(f[:-2] for f in os.listdir(f"{W}/c/{tag}") if f.endswith(".c") an
 for n in names:
     b = f"{W}/bin/{tag}/{n}"
     if not os.path.exists(b):
-        r = subprocess.run(["lockf", LOCK, LIMIT, "600", "5120", "cc", "-std=c11", "-O3", "-w"] + cfl.split() + [f"{W}/c/{tag}/{n}.c", "-o", b, "-lpthread", "-lm"], capture_output=True, text=True)
+        r = subprocess.run(["/Users/macolas/Software/bend-benchmarks/tools/heavy.sh", "600", "4096", "--", "cc", "-std=c11", "-O3", "-w"] + cfl.split() + [f"{W}/c/{tag}/{n}.c", "-o", b, "-lpthread", "-lm"], capture_output=True, text=True)
         if r.returncode: print("CCFAIL", n, r.stderr[-300:], flush=True)
 def expected(n):
     p = os.path.join(BB, n.replace("__", "/") + ".bend"); d = os.path.dirname(p)
@@ -29,7 +29,7 @@ for i in range(0, len(names), batch):
         for r in range(reps):
             for t in ths:
                 lines.append(f"cd {cwd}; echo '@@ {n} {t} {r}'; /usr/bin/time -l {W}/bin/{tag}/{n} +RTS --threads {t} --gpu off -RTS > {W}/o.$$ 2> {W}/e.$$; echo rc=$?; cat {W}/e.$$; echo '@@out'; head -c 200000 {W}/o.$$; echo")
-    p = subprocess.run(["lockf", LOCK, LIMIT, str(120 * len(lines) + 60), "5120", "bash", "-c", "uptime; " + "\n".join(lines)], capture_output=True, text=True, errors="replace")
+    p = subprocess.run(["/Users/macolas/Software/bend-benchmarks/tools/heavy.sh", str(120 * len(lines) + 60), "4096", "--", "bash", "-c", "uptime; " + "\n".join(lines)], capture_output=True, text=True, errors="replace")
     up = p.stdout.split("\n", 1)[0]
     with open(f"{W}/res/{tag}.jsonl", "a") as f:
         for blk in p.stdout.split("@@ ")[1:]:

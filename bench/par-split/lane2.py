@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""lane2.py: the native lane and the memory check, in batches per hold of the shared lock
-(one heavy step at a time, each capped at 5120 MB; bun with BUN_JSC_forceRAMSize).
+"""lane2.py: the native lane and the memory check, in batches, each one call of bend-benchmarks'
+tools/heavy.sh (the machine-wide lock, free memory first, a 4096 MB cap; bun with BUN_JSC_forceRAMSize).
 
   lane2.py list OUT ROOT                 tests with expected lines (as lane.py list)
   lane2.py emit ROOT TAG LIST            C into W/c/TAG/<name>.c (30 emits per hold)
@@ -19,13 +19,13 @@ src = open(f"{H}/lane.py").read().split("if __name__")[0]
 exec(src.replace('W = "/private/tmp/bend-opt/par/lane"', f'W = "{W}"'))
 
 def hold(script, secs):
-    return subprocess.run(["lockf", LOCK, "bash", "-c", script], capture_output=True, text=True, errors="replace", timeout=secs)
+    return subprocess.run(["/Users/macolas/Software/bend-benchmarks/tools/heavy.sh", str(secs), "4096", "--", "bash", "-c", script], capture_output=True, text=True, errors="replace", timeout=secs + 1900)
 
 def emit(root, tag, lst):
     os.makedirs(f"{W}/c/{tag}", exist_ok=True)
     items = [x for x in read_list(lst) if not os.path.exists(f"{W}/c/{tag}/{x[0]}.c")]
     for i in range(0, len(items), 30):
-        sh_ = "\n".join(f"cd {root}; BUN_JSC_forceRAMSize=3000000000 {L} 600 5120 bun {root}/bend2/main.ts {p} -o {W}/c/{tag}/{n}.tmp.c > /dev/null 2>&1 && mv {W}/c/{tag}/{n}.tmp.c {W}/c/{tag}/{n}.c || echo EMITFAIL {n}" for n, p in items[i:i + 30])
+        sh_ = "\n".join(f"cd {root}; BUN_JSC_forceRAMSize=3000000000 bun {root}/bend2/main.ts {p} -o {W}/c/{tag}/{n}.tmp.c > /dev/null 2>&1 && mv {W}/c/{tag}/{n}.tmp.c {W}/c/{tag}/{n}.c || echo EMITFAIL {n}" for n, p in items[i:i + 30])
         print(hold(sh_, 30 * 700).stdout, end="", flush=True)
     print("emitted", tag)
 
@@ -61,11 +61,11 @@ def run(tag, lst, mem, only):
             open(f"{d}/p.c", "w").write(c)
             objc = "-x objective-c -fobjc-arc -fmodules" if re.search(r"^#import ", c, re.M) else ""
             flags = "-DBEND_POISON" if mem else ""
-            lines.append(f"cd {d}; echo '@@ {name}'; {L} 900 5120 clang {objc} -std=c11 -O3 -w {flags} p.c -o p -lpthread -lm > cc.txt 2>&1; echo cc=$?")
+            lines.append(f"cd {d}; echo '@@ {name}'; clang {objc} -std=c11 -O3 -w {flags} p.c -o p -lpthread -lm > cc.txt 2>&1; echo cc=$?")
             for t in ((1, 8) if mem else (None,)):
                 th = f"--threads {t} " if t else ""
                 k = f"t{t}" if t else "run"
-                lines.append(f"cd {W}; [ -x {d}/p ] && {{ {L} {150 if mem else 60} 5120 perl -e 'alarm {120 if mem else 30}; exec @ARGV' {d}/p +RTS {th}--gpu off -RTS > {d}/{k}.out 2> {d}/{k}.err; echo {k}=$?; }}")
+                lines.append(f"cd {W}; [ -x {d}/p ] && {{ perl -e 'alarm {120 if mem else 30}; exec @ARGV' {d}/p +RTS {th}--gpu off -RTS > {d}/{k}.out 2> {d}/{k}.err; echo {k}=$?; }}")
         out = hold("\n".join(lines), 20 * 3000).stdout
         for blk in out.split("@@ ")[1:]:
             name = blk.split("\n", 1)[0].strip(); d = f"{W}/build/{tag}/{name}"

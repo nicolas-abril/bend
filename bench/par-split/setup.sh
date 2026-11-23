@@ -3,7 +3,7 @@
 # main, integ, exit (opt/par-exit-seq), sp (opt/par-split) and sp2 (sp with
 # -DFK_CONT=1). W=/private/tmp/bend-opt/par/work. Heavy steps under the lock.
 set -u
-H=$(cd "$(dirname "$0")" && pwd); . $H/heavy.sh
+H=$(cd "$(dirname "$0")" && pwd)
 P=/private/tmp/bend-opt/par
 mkdir -p $P/work; touch /private/tmp/bend-opt/timing.lock
 cc -O2 -o $P/tm $H/tm.c
@@ -13,7 +13,7 @@ done
 mkdir -p $P/work/bin/sp2
 script=""
 for n in $(awk '{print $1}' $P/work/bin/sp/.names); do
-  [ -x $P/work/bin/sp2/$n ] || script+="~/Software/supgen-bend/limit 600 5120 cc -std=c11 -O3 -w -DFK_CONT=1 $P/work/bin/sp/$n.c -o $P/work/bin/sp2/$n -lpthread;"$'\n'
+  [ -x $P/work/bin/sp2/$n ] || script+="cc -std=c11 -O3 -w -DFK_CONT=1 $P/work/bin/sp/$n.c -o $P/work/bin/sp2/$n -lpthread;"$'\n'
 done
-[ -n "$script" ] && lockf /private/tmp/bend-opt/timing.lock bash -c "$script"
+[ -n "$script" ] && /Users/macolas/Software/bend-benchmarks/tools/heavy.sh 3600 4096 -- bash -c "$script"
 cp $P/work/bin/sp/.names $P/work/bin/sp2/

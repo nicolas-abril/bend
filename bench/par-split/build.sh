@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build.sh CHECKOUT TAG [progs file] -> W/bin/TAG/<name>{.c,} and .names; CFLAGS_EXTRA for cc.
-# Emits and cc's run one at a time, in batches of 9 programs per hold of the shared lock, each
-# step capped at 5120 MB (bun with BUN_JSC_forceRAMSize).
+# Emits and cc's run one at a time, in batches of 9 programs per call of bend-benchmarks'
+# tools/heavy.sh (the machine-wide lock, free memory first, a 4096 MB cap; bun with BUN_JSC_forceRAMSize).
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
 root=$1; tag=$2; list=${3:-$H/progs.txt}
@@ -20,8 +20,8 @@ for part in $todo.part.*; do
   [ -s $part ] || continue
   script=""
   while read n src; do
-    script+="BUN_JSC_forceRAMSize=3000000000 ~/Software/supgen-bend/limit 600 5120 bun $root/bend2/main.ts $src -o $out/$n.c > $out/$n.log 2>&1 && ~/Software/supgen-bend/limit 600 5120 cc -std=c11 -O3 -w $out/$n.c -o $out/$n -lpthread ${CFLAGS_EXTRA:-} >> $out/$n.log 2>&1 || echo 'FAIL $n';"$'\n'
+    script+="BUN_JSC_forceRAMSize=3000000000 bun $root/bend2/main.ts $src -o $out/$n.c > $out/$n.log 2>&1 && cc -std=c11 -O3 -w $out/$n.c -o $out/$n -lpthread ${CFLAGS_EXTRA:-} >> $out/$n.log 2>&1 || echo 'FAIL $n';"$'\n'
   done < $part
-  lockf /private/tmp/bend-opt/timing.lock bash -c "$script"
+  /Users/macolas/Software/bend-benchmarks/tools/heavy.sh 3600 4096 -- bash -c "$script"
 done
 rm -f $todo $todo.part.*

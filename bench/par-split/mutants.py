@@ -2,7 +2,7 @@
 """mutants.py: wrong versions of the lazy-split runtime, each checked against the
 lazy-split tests at 1, 2, 4 and 10 threads (3 runs each). Emits the tests with the
 split checkout, applies each mutation to the C, builds and runs, all in one hold of
-the lock (one heavy step at a time, 5120 MB). Prints which mutants the tests catch."""
+one call of tools/heavy.sh (lock, free memory, 4096 MB). Prints which mutants the tests catch."""
 import os, re, subprocess
 S = "/private/tmp/bend-opt/par/split"; D = "/private/tmp/bend-opt/par/mut"
 L = os.path.expanduser("~/Software/supgen-bend/limit")
@@ -22,8 +22,8 @@ os.makedirs(D, exist_ok=True)
 sh = []
 for t in tests:
     if os.path.exists(f"{D}/{t}.c"): continue
-    sh.append(f"cd {S}; BUN_JSC_forceRAMSize=3000000000 {L} 600 5120 bun bend2/main.ts tests/run/{t}.bend -o {D}/{t}.c > /dev/null 2>&1 || echo EMITFAIL {t}")
-sh and subprocess.run(["lockf", "/private/tmp/bend-opt/timing.lock", "bash", "-c", "\n".join(sh)])
+    sh.append(f"cd {S}; BUN_JSC_forceRAMSize=3000000000 bun bend2/main.ts tests/run/{t}.bend -o {D}/{t}.c > /dev/null 2>&1 || echo EMITFAIL {t}")
+sh and subprocess.run(["/Users/macolas/Software/bend-benchmarks/tools/heavy.sh", "1800", "4096", "--", "bash", "-c", "\n".join(sh)])
 want = {t: "\n".join(l[2:] for l in open(f"{S}/tests/run/{t}.bend").read().split("\n") if l.startswith("#|")).strip() for t in tests}
 sh = []
 for m, eds in MUT.items():
@@ -35,11 +35,11 @@ for m, eds in MUT.items():
                 raise SystemExit(f"mutant {m}: pattern not found in {t}: {a[:50]}")
             c = c.replace(a, b, 1)
         open(f"{D}/{m}.{t}.c", "w").write(c)
-        sh.append(f"{L} 300 5120 cc -std=c11 -O3 -w {D}/{m}.{t}.c -o {D}/{m}.{t} -lpthread || echo CCFAIL {m} {t}")
+        sh.append(f"cc -std=c11 -O3 -w {D}/{m}.{t}.c -o {D}/{m}.{t} -lpthread || echo CCFAIL {m} {t}")
         for th in (1, 2, 4, 10):
             for r in range(3):
-                sh.append(f"echo \"@@ {m} {t} {th} $({L} 30 5120 {D}/{m}.{t} +RTS --threads {th} --gpu off -RTS 2>&1 | tr '\\n' ' ' | cut -c1-80)\"")
-out = subprocess.run(["lockf", "/private/tmp/bend-opt/timing.lock", "bash", "-c", "\n".join(sh)], capture_output=True, text=True).stdout
+                sh.append(f"echo \"@@ {m} {t} {th} $(perl -e 'alarm 30; exec @ARGV' {D}/{m}.{t} +RTS --threads {th} --gpu off -RTS 2>&1 | tr '\\n' ' ' | cut -c1-80)\"")
+out = subprocess.run(["/Users/macolas/Software/bend-benchmarks/tools/heavy.sh", "3600", "4096", "--", "bash", "-c", "\n".join(sh)], capture_output=True, text=True).stdout
 res = {}
 for l in out.splitlines():
     if l.startswith("@@ "):
