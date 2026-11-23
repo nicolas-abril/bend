@@ -22,7 +22,7 @@ PY
 for t in integ exit sp; do python3 -I $H/run244.py $t > $W/run244_$t.txt 2>&1; cp $P/b244/res/$t.jsonl $W/b244_$t.jsonl; $H/save.sh >/dev/null 2>&1; log "244 $t run"; done
 python3 -I $H/lane2.py list $LN/tests.list $P/integ > /dev/null
 python3 -I $H/lane2.py emit $P/integ integ $LN/tests.list > $LN/emit_integ.log 2>&1; log "lane integ emitted"
-python3 -I $H/lane2.py derive integ exit $LN/tests.list 'seq = \(seq & 1\) \| fid_nofk\(wf\) << 1;=>seq = (DEVICE ? seq \& 1 : 0) | fid_nofk(wf) << 1;' >> $LN/emit_integ.log
+python3 -I $H/lane2.py derive integ exit $LN/tests.list 'seq = \(seq & 1\) \| fid_nofk\(wf\) << 1;=>seq = (DEVICE ? seq & 1 : 0) | fid_nofk(wf) << 1;' >> $LN/emit_integ.log
 python3 -I $H/lane2.py emit $P/split sp $LN/tests.list > $LN/emit_sp.log 2>&1; log "lane sp emitted"
 grep -l 'if (!seq)' $LN/c/integ/*.c | xargs -n1 basename | sed 's/\.c$//' > $LN/forktests.txt
 for t in integ exit sp; do python3 -I $H/lane2.py run $t $LN/tests.list > $LN/run_$t.log 2>&1; log "lane $t run"; done
