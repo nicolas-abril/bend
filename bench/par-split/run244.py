@@ -12,11 +12,11 @@ reps = int(opt("--reps", "1"))
 tag = a[0]; btag = opt("--as", tag) if False else tag
 os.makedirs(f"{W}/bin/{tag}", exist_ok=True); os.makedirs(f"{W}/res", exist_ok=True)
 names = sorted(f[:-2] for f in os.listdir(f"{W}/c/{tag}") if f.endswith(".c") and not f.endswith(".tmp.c") and filt in f)
-for n in names:
-    b = f"{W}/bin/{tag}/{n}"
-    if not os.path.exists(b):
-        r = subprocess.run(["/Users/macolas/Software/bend-benchmarks/tools/heavy.sh", "600", "4096", "--", "cc", "-std=c11", "-O3", "-w"] + cfl.split() + [f"{W}/c/{tag}/{n}.c", "-o", b, "-lpthread", "-lm"], capture_output=True, text=True)
-        if r.returncode: print("CCFAIL", n, r.stderr[-300:], flush=True)
+todo = [n for n in names if not os.path.exists(f"{W}/bin/{tag}/{n}")]
+for i in range(0, len(todo), 30):
+    sh = "\n".join(f"cc -std=c11 -O3 -w {cfl} {W}/c/{tag}/{n}.c -o {W}/bin/{tag}/{n} -lpthread -lm 2> {W}/bin/{tag}/{n}.cclog || echo CCFAIL {n}" for n in todo[i:i + 30])
+    r = subprocess.run(["/Users/macolas/Software/bend-benchmarks/tools/heavy.sh", "3600", "4096", "--", "bash", "-c", sh], capture_output=True, text=True)
+    print(r.stdout, end="", flush=True)
 def expected(n):
     p = os.path.join(BB, n.replace("__", "/") + ".bend"); d = os.path.dirname(p)
     for e in (f"{d}/expected.txt", f"{os.path.dirname(d)}/expected.txt"):
