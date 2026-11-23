@@ -16,3 +16,4 @@ max-indep-set done 20 runs
 delaunay done 20 runs
 m-dpar done 20 runs
 primes done 20 runs
+primes-simple-bool done 20 runs
