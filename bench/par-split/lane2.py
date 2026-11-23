@@ -5,7 +5,7 @@ tools/heavy.sh (the machine-wide lock, free memory first, a 4096 MB cap; bun wit
   lane2.py list OUT ROOT                 tests with expected lines (as lane.py list)
   lane2.py emit ROOT TAG LIST            C into W/c/TAG/<name>.c (30 emits per hold)
   lane2.py derive FROM TAG LIST SED      W/c/TAG/<name>.c = W/c/FROM/<name>.c with a python re.sub (SED = 'pat=>rep')
-  lane2.py run TAG LIST [--mem] [--only FILE]   build -O3 (--mem: live words, -DBEND_POISON, threads 1 and 8), run
+  lane2.py run TAG LIST [--mem] [--gpu] [--only FILE]   build -O3 (--mem: live words, -DBEND_POISON, threads 1 and 8), run
                                          (20 per hold); results W/c/TAG.<list>.<run|mem>.json
   lane2.py cmp A B LIST ROOT [--mem]     statuses
 """
@@ -41,9 +41,9 @@ def derive(frm, tag, lst, sed):
             open(f"{W}/c/{tag}/{name}.c", "w").write(c)
     print("derived", n, "changed")
 
-def run(tag, lst, mem, only):
+def run(tag, lst, mem, only, gpu=False):
     keep = set(open(only).read().split()) if only else None
-    res_f = f"{W}/c/{tag}.{os.path.basename(lst)}.{'mem' if mem else 'run'}.json"
+    res_f = f"{W}/c/{tag}.{os.path.basename(lst)}.{'mem' if mem else 'gpu' if gpu else 'run'}.json"
     res = json.load(open(res_f)) if os.path.exists(res_f) else {}
     items = [x for x in read_list(lst) if (keep is None or x[0] in keep) and x[0] not in res]
     for i in range(0, len(items), 20):
@@ -65,7 +65,7 @@ def run(tag, lst, mem, only):
             for t in ((1, 8) if mem else (None,)):
                 th = f"--threads {t} " if t else ""
                 k = f"t{t}" if t else "run"
-                lines.append(f"cd {W}; [ -x {d}/p ] && {{ perl -e 'alarm {120 if mem else 30}; exec @ARGV' {d}/p +RTS {th}--gpu off -RTS > {d}/{k}.out 2> {d}/{k}.err; echo {k}=$?; }}")
+                lines.append(f"cd {W}; [ -x {d}/p ] && {{ perl -e 'alarm {120 if mem else 30}; exec @ARGV' {d}/p +RTS {th}--gpu {'on' if gpu else 'off'} -RTS > {d}/{k}.out 2> {d}/{k}.err; echo {k}=$?; }}")
         out = hold("\n".join(lines), 20 * 3000).stdout
         for blk in out.split("@@ ")[1:]:
             name = blk.split("\n", 1)[0].strip(); d = f"{W}/build/{tag}/{name}"
@@ -88,5 +88,5 @@ if __name__ == "__main__":
     if a[0] == "list": do_list(a[1], a[2])
     elif a[0] == "emit": emit(a[1], a[2], a[3])
     elif a[0] == "derive": derive(a[1], a[2], a[3], a[4])
-    elif a[0] == "run": run(a[1], a[2], "--mem" in a, a[a.index("--only") + 1] if "--only" in a else None)
+    elif a[0] == "run": run(a[1], a[2], "--mem" in a, a[a.index("--only") + 1] if "--only" in a else None, "--gpu" in a)
     elif a[0] == "cmp": do_cmp(a[1], a[2], a[3], "--mem" in a, a[4])

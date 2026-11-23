@@ -12,10 +12,10 @@ MUT = {
   "split-newest": [("  if (lo >= hi || ~bits == 0 || err_seen(e.mem)) {", "  lo = hi;\n  if (~bits == 0 || err_seen(e.mem)) {")],
   "no-wait": [("    fk_help(e, sp, a32_at(e.mem, task_tail(fut) + 1));", "    (void)0;")],
   "no-drop": [("#define WL_FKDROP       if (seq & FK_SEQ) { fk_drop(e); }", "#define WL_FKDROP")],
-  "future-runs": [("  if (term_aux(cont) == FID_Fk_fut) {", "  if (0) {")],
   "result-word": [("      r0 = fk_v[0];", "      r0 = fk_v[1];")],
   "no-reclaim": [("  if (__atomic_compare_exchange_n(&fk_box[me][t->slot], &tk, 0, false,", "  if (0 && __atomic_compare_exchange_n(&fk_box[me][t->slot], &tk, 0, false,")],
   "steal-no-cas": [("      if (t != 0 && __atomic_compare_exchange_n(&fk_box[w][s], &t, 0, false,\n          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {", "      if (t != 0) {")],
+  "no-gap": [("  if (now < e.alc[FK_NEXT]) {", "  if (0) {")],
   "early-done": [("        fk_help(e, stk, NULL);\n", "")],
 }
 os.makedirs(D, exist_ok=True)
@@ -38,8 +38,14 @@ for m, eds in MUT.items():
         sh.append(f"cc -std=c11 -O3 -w {D}/{m}.{t}.c -o {D}/{m}.{t} -lpthread || echo CCFAIL {m} {t}")
         for th in (1, 2, 4, 10):
             for r in range(3):
-                sh.append(f"echo \"@@ {m} {t} {th} $(perl -e 'alarm 30; exec @ARGV' {D}/{m}.{t} +RTS --threads {th} --gpu off -RTS 2>&1 | tr '\\n' ' ' | cut -c1-80)\"")
-out = subprocess.run(["/Users/macolas/Software/bend-benchmarks/tools/heavy.sh", "3600", "4096", "--", "bash", "-c", "\n".join(sh)], capture_output=True, text=True).stdout
+                sh.append(f"echo \"@@ {m} {t} {th} $(perl -e 'alarm 20; exec @ARGV' {D}/{m}.{t} +RTS --threads {th} --gpu off -RTS 2>&1 | tr '\\n' ' ' | cut -c1-80)\"")
+# one heavy call per mutant: a mutant that eats memory is killed alone
+out = ""
+for m in MUT:
+    part = [l for l in sh if f"{D}/{m}." in l]
+    r = subprocess.run(["/Users/macolas/Software/bend-benchmarks/tools/heavy.sh", "1800", "4096", "--", "bash", "-c", "\n".join(part)], capture_output=True, text=True)
+    out += r.stdout
+    if r.returncode: print(f"{m}: the heavy call ended with {r.returncode} (cap or timeout)", r.stderr[-200:].strip())
 res = {}
 for l in out.splitlines():
     if l.startswith("@@ "):
