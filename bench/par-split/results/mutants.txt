@@ -1,0 +1,12 @@
+split-newest: the heavy call ended with 137 (cap or timeout) limit: over 4096 MB (held 4144 MB): killed
+no-drop: the heavy call ended with 137 (cap or timeout) limit: over 4096 MB (held 4235 MB): killed
+steal-no-cas: the heavy call ended with 137 (cap or timeout) limit: over 4096 MB (held 4160 MB): killed
+ok             not caught (0 of 60 runs wrong)
+split-newest   CAUGHT (4 of 17 runs wrong) e.g. lazy_split_deep t4: 
+no-wait        CAUGHT (24 of 60 runs wrong) e.g. lazy_split_unbal t2: 2762828544
+no-drop        not caught (0 of 6 runs wrong)
+result-word    CAUGHT (17 of 60 runs wrong) e.g. lazy_split_unbal t2: 2762828544
+no-reclaim     not caught (0 of 60 runs wrong)
+steal-no-cas   CAUGHT (5 of 18 runs wrong) e.g. lazy_split_deep t4: 542686879
+no-gap         not caught (0 of 60 runs wrong)
+early-done     not caught (0 of 60 runs wrong)
