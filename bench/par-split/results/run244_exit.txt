@@ -1,0 +1,9 @@
+batch 0 done (30) 17:50  up  1:48, 1 user, load averages: 3.55 3.61 3.78
+batch 1 done (30) 17:52  up  1:49, 1 user, load averages: 4.09 3.77 3.83
+batch 2 done (30) 17:54  up  1:51, 1 user, load averages: 3.81 3.78 3.82
+batch 3 done (30) 17:55  up  1:53, 1 user, load averages: 3.67 3.71 3.79
+batch 4 done (30) 17:56  up  1:53, 1 user, load averages: 5.15 4.02 3.90
+batch 5 done (30) 17:57  up  1:54, 1 user, load averages: 4.82 4.15 3.95
+batch 6 done (30) 17:57  up  1:55, 1 user, load averages: 5.29 4.38 4.05
+batch 7 done (30) 17:59  up  1:56, 1 user, load averages: 3.83 4.18 4.00
+batch 8 done (4) 18:00  up  1:57, 1 user, load averages: 3.86 4.08 3.97
