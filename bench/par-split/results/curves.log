@@ -6,3 +6,4 @@ bt-par done 80 runs
 ALLDONE
 m-unbal done 20 runs
 bfs done 20 runs
+bfs-delayed done 20 runs
