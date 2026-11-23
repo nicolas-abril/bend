@@ -11,3 +11,4 @@ bfs-det-priority done 20 runs
 bfs-det-dedup done 20 runs
 bfs-tree-entangled-fixed done 20 runs
 centrality done 20 runs
+low-d-decomp done 20 runs
