@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# emit244.py ROOT TAG [-j N]: bend-benchmarks' 244 programs to W/c/TAG/<name>.c (cwd = the program's dir)
+# emit244.py ROOT TAG: (each emit alone under the lock, 5120 MB) bend-benchmarks' 244 programs to W/c/TAG/<name>.c (cwd = the program's dir)
 import concurrent.futures as cf, os, subprocess, sys
 BB = "/Users/macolas/Software/bend-benchmarks"; W = "/private/tmp/bend-opt/par/b244"
 def programs():
@@ -10,12 +10,14 @@ def programs():
     return sorted(out)
 name = lambda p: os.path.relpath(p, BB).replace("/", "__")[:-5]
 root, tag = sys.argv[1], sys.argv[2]
-j = int(sys.argv[sys.argv.index("-j") + 1]) if "-j" in sys.argv else 2
+j = 1  # one heavy process at a time (memory rules)
 os.makedirs(f"{W}/c/{tag}", exist_ok=True)
 def emit(p):
     dst = f"{W}/c/{tag}/{name(p)}.c"
     if os.path.exists(dst): return "cached"
-    r = subprocess.run(["bun", f"{root}/bend2/main.ts", p, "-o", dst + ".tmp.c"], cwd=os.path.dirname(p), capture_output=True, text=True, timeout=900)
+    env = dict(os.environ, BUN_JSC_forceRAMSize="3000000000")
+    r = subprocess.run(["lockf", "/private/tmp/bend-opt/timing.lock", os.path.expanduser("~/Software/supgen-bend/limit"), "900", "5120",
+                        "bun", f"{root}/bend2/main.ts", p, "-o", dst + ".tmp.c"], cwd=os.path.dirname(p), capture_output=True, text=True, env=env)
     if r.returncode == 0 and os.path.exists(dst + ".tmp.c"): os.rename(dst + ".tmp.c", dst); return "ok"
     open(dst[:-2] + ".emitfail", "w").write(r.stdout[-2000:] + r.stderr[-2000:]); return "FAIL"
 ps = programs(); print(len(ps))

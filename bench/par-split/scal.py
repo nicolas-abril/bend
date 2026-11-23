@@ -31,7 +31,7 @@ for gi in range(0, len(ps), a.group):
                     if os.path.exists(exe):
                         jobs.append({"exe": exe, "threads": int(t), "meta": [n, b, int(t), r]})
     jf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, dir=W); json.dump(jobs, jf); jf.close()
-    p = subprocess.run(["lockf", "/private/tmp/bend-opt/timing.lock", os.path.expanduser("~/Software/supgen-bend/limit"), str(60 + 30 * len(jobs)), "6144",
+    p = subprocess.run(["lockf", "/private/tmp/bend-opt/timing.lock", os.path.expanduser("~/Software/supgen-bend/limit"), str(60 + 30 * len(jobs)), "5120",
                         "python3", "-I", f"{H}/batch.py", jf.name], capture_output=True, text=True)
     os.unlink(jf.name)
     with open(a.out, "a") as f:

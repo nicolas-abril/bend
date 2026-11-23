@@ -88,7 +88,7 @@ def emit_one(root, tag, name, path, js):
     dst = f"{W}/c/{tag}/{name}.{ext}"
     if os.path.exists(dst):
         return name, "cached"
-    rc, o, e = sh(f"bun {root}/bend2/main.ts {path} -o {dst}.tmp.{ext}", cwd=root, timeout=600)
+    rc, o, e = sh(f"BUN_JSC_forceRAMSize=3000000000 lockf /private/tmp/bend-opt/timing.lock ~/Software/supgen-bend/limit 600 5120 bun {root}/bend2/main.ts {path} -o {dst}.tmp.{ext}", cwd=root, timeout=700)
     if rc == 0 and os.path.exists(f"{dst}.tmp.{ext}"):
         os.rename(f"{dst}.tmp.{ext}", dst)
         return name, "ok"
@@ -130,14 +130,14 @@ def build_run(cfile, mem, cwd):
     open(f"{d}/p.c", "w").write(c)
     objc = "-x objective-c -fobjc-arc -fmodules" if re.search(r"^#import ", c, re.M) else ""
     flags = "-DBEND_POISON" if mem else ""
-    rc, o, e = sh(f"clang {objc} -std=c11 -O3 -w {flags} p.c -o p -lpthread -lm", cwd=d, timeout=900)
+    rc, o, e = sh(f"lockf /private/tmp/bend-opt/timing.lock ~/Software/supgen-bend/limit 900 5120 clang {objc} -std=c11 -O3 -w {flags} p.c -o p -lpthread -lm", cwd=d, timeout=1000)
     if rc != 0:
         r = {"build": f"fail {rc}", "err": e[-2000:]}
     else:
         r = {"build": "ok"}
         for t in ((1, 8) if mem else (None,)):
             th = f"--threads {t} " if t else ""
-            rc, o, e = sh(f"perl -e 'alarm {120 if mem else 30}; exec @ARGV' {d}/p +RTS {th}--gpu off -RTS", cwd=cwd, timeout=200)
+            rc, o, e = sh(f"lockf /private/tmp/bend-opt/timing.lock ~/Software/supgen-bend/limit {150 if mem else 60} 5120 perl -e 'alarm {120 if mem else 30}; exec @ARGV' {d}/p +RTS {th}--gpu off -RTS", cwd=cwd, timeout=400)
             k = f"t{t}" if t else "run"
             live = re.findall(r"^LIVE (-?\d+)$", e, re.M)
             r[k] = {"rc": rc, "out": tidy(o)[-4000:], "err": tidy(re.sub(r"^LIVE -?\d+\n?", "", e, flags=re.M))[-1000:],
@@ -198,7 +198,7 @@ def do_cmp(a, b, lst, mem, root):
 
 if __name__ == "__main__":
     a = sys.argv[1:]
-    j = int(a[a.index("-j") + 1]) if "-j" in a else 4
+    j = 1  # one heavy process at a time (memory rules); -j ignored
     flags = [x for x in a if x.startswith("--")]
     pos = [x for i, x in enumerate(a) if not x.startswith("--") and x != "-j" and (i == 0 or a[i - 1] != "-j")]
     cmd = pos[0]
