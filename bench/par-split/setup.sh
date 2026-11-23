@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # setup.sh: after a wipe of /private/tmp: tm, and the binaries of progs.txt for
-# main, integ, exit (opt/par-exit-seq), sp (opt/par-split) and sp2 (sp with
-# -DFK_CONT=1). W=/private/tmp/bend-opt/par/work. Heavy steps under the lock.
+# main, integ, exit (opt/par-exit-seq) and sp (opt/par-split).
+# W=/private/tmp/bend-opt/par/work. Heavy steps through tools/heavy.sh.
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
 P=/private/tmp/bend-opt/par
@@ -10,10 +10,3 @@ cc -O2 -o $P/tm $H/tm.c
 for x in ${BUILDS:-integ:integ exit:exit split:sp main:main}; do
   d=${x%:*}; b=${x#*:}; [ -d $P/$d ] && $H/build.sh $P/$d $b
 done
-mkdir -p $P/work/bin/sp2
-script=""
-for n in $(awk '{print $1}' $P/work/bin/sp/.names); do
-  [ -x $P/work/bin/sp2/$n ] || script+="cc -std=c11 -O3 -w -DFK_CONT=1 $P/work/bin/sp/$n.c -o $P/work/bin/sp2/$n -lpthread;"$'\n'
-done
-[ -n "$script" ] && /Users/macolas/Software/bend-benchmarks/tools/heavy.sh 3600 4096 -- bash -c "$script"
-cp $P/work/bin/sp/.names $P/work/bin/sp2/
