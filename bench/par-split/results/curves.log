@@ -7,3 +7,4 @@ ALLDONE
 m-unbal done 20 runs
 bfs done 20 runs
 bfs-delayed done 20 runs
+bfs-det-priority done 20 runs
