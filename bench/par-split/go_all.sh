@@ -7,8 +7,7 @@ set -u
 H=$(cd "$(dirname "$0")" && pwd); P=/private/tmp/bend-opt/par; W=$P/work; LN=$P/lane
 log() { echo "$(date +%H:%M) $*" >> $W/go_all.log; }
 mkdir -p $W $LN
-log setup; $H/setup.sh > $P/setup.log 2>&1; log "setup done $(grep -c FAIL $P/setup.log) fails"
-$H/go_ab.sh curves.jsonl main,integ,exit,sp 1,2,4,10 5 seam-carve suffix-array m-tiny m-sharedarr bt-par; log curves done
+[ -z "${SKIP_TO_244:-}" ] && { log setup; $H/setup.sh > $P/setup.log 2>&1; log "setup done $(grep -c FAIL $P/setup.log) fails"; $H/go_ab.sh curves.jsonl main,integ,exit,sp 1,2,4,10 5 seam-carve suffix-array m-tiny m-sharedarr bt-par; log curves done; }
 python3 -I $H/emit244.py $P/integ integ > $W/emit244_integ.txt 2>&1; log "244 integ emitted"
 python3 -I $H/emit244.py $P/split sp > $W/emit244_sp.txt 2>&1; log "244 sp emitted"
 python3 - <<PY
