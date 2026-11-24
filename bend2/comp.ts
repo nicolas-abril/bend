@@ -1553,6 +1553,208 @@ function def_fix(k: Name): boolean {
   return true;
 }
 
+// Lit
+// ===
+
+// A call of a def on closed arguments (no variable in them) runs at compile
+// time, on the checker's evaluator with LIT_FUEL def unfoldings (LIT_ALL in
+// a program), and becomes its value when that is a constant of at most
+// LIT_SIZE nodes: Nats, U32s, strings and other constructors, no F32, no
+// function, no Array. A call whose one open argument calls a def that
+// answers a closed constant from every arm of its match (word(k) in
+// textstats) calls a copy of that def whose arms answer the outer call's
+// values (score(word(k)): one Nat an arm).
+
+const LIT_FUEL = 1 << 16;
+const LIT_ALL = 1 << 22;
+const LIT_SIZE = 64;
+const LIT_OUT = { lit: true };
+
+function lit_book(roots: Name[]): void {
+  const todo = [...roots];
+  const seen = new Set<Name>();
+  while (todo.length > 0) {
+    const k = todo.pop()!;
+    const tld = tld_of(k);
+    if (seen.has(k) || !done_live(tld) || def_foreign(tld)) {
+      seen.add(k);
+      continue;
+    }
+    seen.add(k);
+    const f = fun_of(k);
+    const e0 = Bend.term_lower(f.h!);
+    const e = lit_walk(e0);
+    if (e !== e0) {
+      f.h = Bend.term_higher(e);
+    }
+    clo_vars(e, (y) => y.$ === "Ref" && todo.push(y.k));
+  }
+}
+
+function lit_walk(t: any): any {
+  const r = t.$ === "Ann" ? lit_call(t) : null;
+  let out = r ?? t;
+  const put = (j: string, v: any) => {
+    if (v !== out[j]) {
+      out = out === t ? { ...t } : out;
+      out[j] = v;
+    }
+  };
+  for (const j of ["f", "x", "h", "m", "v"]) {
+    const y = out[j];
+    if (Array.isArray(y)) {
+      const vs = y.map(lit_walk);
+      vs.some((v, i) => v !== y[i]) && put(j, vs);
+    } else if (y && typeof y === "object" && y.$) {
+      put(j, lit_walk(y));
+    }
+  }
+  return out;
+}
+
+// A full call's head def and arguments, under its annotations.
+function lit_spine(t: any): { k: Name; xs: any[] } | null {
+  let s = t;
+  const xs: any[] = [];
+  for (; s.$ === "Ann" || s.$ === "App"; s = s.$ === "Ann" ? s.x : s.f) {
+    s.$ === "App" && xs.unshift(s.x);
+  }
+  const d = s.$ === "Ref" && !s.b ? tld_of(s.k) : undefined;
+  return d && done_live(d) && !def_foreign(d) && !(s.k in FL.made)
+    && d.x === 0 && xs.length === d.n ? { k: s.k, xs } : null;
+}
+
+// t's spine with argument j replaced by x, head by k and types' results by R
+function lit_swap(t: any, j: number, x: any, k?: Name, R?: any): any {
+  const n = lit_spine(t)!.xs.length;
+  const go = (s: any, i: number, top: boolean): any => s.$ === "Ann"
+    ? Bend.Ann(go(s.x, i, false), R ? top ? R : lit_ret(s.T, R) : s.T, s.s)
+    : s.$ === "App" ? Bend.App(go(s.f, i - 1, false),
+      i === j ? x : s.x, s.s)
+    : k ? Bend.Ref(k, s.s) : s;
+  return go(t, n - 1, true);
+}
+
+function lit_ret(T: any, R: any): any {
+  return T.$ === "All" ? Bend.All(T.q, T.k, T.i, T.A, lit_ret(T.B, R), T.s) : R;
+}
+
+const lit_open = (t: any) => lt_any(t, (y) => y.$ === "Var");
+
+function lit_call(t: any): any | null {
+  const m = lit_spine(t);
+  if (m === null || lt_any(t.T, (y) => y.$ === "Var" || y.$ === "All"
+    || ((y.$ === "Ref" || y.$ === "ADT") && "IO F32 Array".split(" ")
+      .includes(y.k)))) {
+    return null;
+  }
+  const open = m.xs.flatMap((x, i) => lit_open(x) ? [i] : []);
+  if (open.length === 0) {
+    const v = lit_eval(t);
+    return v && Bend.Ann(v, t.T, t.s);
+  }
+  const g = open.length === 1 ? lit_spine(m.xs[open[0]]) : null;
+  const gd = g && tld_of(g.k) as Bend.Def;
+  if (!g || fun_of(g.k).h === null || gd!.n !== fun_of(g.k).n) {
+    return null;
+  }
+  // g's body, each arm's closed answer a replaced by this call's value on a
+  const j = open[0];
+  const key = `${g.k}~${m.k}~${Bend.term_key(lit_swap(t, j, Bend.Ref("~")))}`;
+  let kf: Name | null | undefined = FL.litk.get(key);
+  if (kf === undefined) {
+    let n = 0;
+    const arms = (s: any): any => {
+      const x = s.$ === "Ann" ? s.x : s;
+      if (s.$ === "Ann" && "Mat Lam Efq".includes(x.$)) {
+        const b = arms(x);
+        return b && Bend.Ann(b, lit_ret(s.T, t.T), s.s);
+      }
+      if (x.$ === "Mat") {
+        const [h, e] = [arms(x.h), arms(x.m)];
+        return h && e && Bend.Mat(x.k, h, e, x.s);
+      }
+      if (x.$ === "Lam") {
+        const b = arms(x.f);
+        return b && Bend.Lam(x.k, x.i, b, x.s, x.q);
+      }
+      if (x.$ === "Efq") {
+        return x;
+      }
+      const v = ++n <= 32 && !lit_open(s) ? lit_eval(lit_swap(t, j, s)) : null;
+      return v && Bend.Ann(v, t.T, s.s);
+    };
+    const e = arms(Bend.term_lower(fun_of(g.k).h!));
+    kf = e ? `${g.k}~lit${FL.litk.size}` : null;
+    FL.litk.set(key, kf);
+    if (e) {
+      FL.made[kf!] = { ...gd!, T: Bend.term_higher(lit_ret(Bend.term_lower(gd!.T),
+        t.T)), v: Bend.term_higher(e), e };
+    }
+  }
+  return kf && lit_swap(m.xs[j], -1, null, kf, t.T);
+}
+
+// A closed call's value, as a constant term, or null.
+function lit_eval(t: any): any | null {
+  const n = Math.min(LIT_FUEL, FL.litfuel);
+  let fuel = n;
+  const tlds = new Proxy(FL.book.tlds, { get: (o, k) => {
+    if (--fuel < 0) {
+      throw LIT_OUT;
+    }
+    return o[k as Name];
+  } });
+  let v: HTerm;
+  try {
+    v = Bend.term_snf({ ...FL.book, tlds }, Bend.term_higher(t));
+  } catch (x) {
+    return null;
+  } finally {
+    FL.litfuel -= n - Math.max(fuel, 0);
+  }
+  let size = 0;
+  const go = (y: HTerm): any => {
+    const s = term_strip(y);
+    if (++size > LIT_SIZE) {
+      return null;
+    }
+    if (s.$ === "Lit") {
+      return s.k === "F32" ? null : s;
+    }
+    if (s.$ !== "Ctr" || s.k === "F32") {
+      return null;
+    }
+    const n = Bend.nat_from_term(Bend.term_lower(s));
+    if (n !== null && (s.k === "Succ" || s.k === "Zero")) {
+      return Bend.Lit("Nat", n);
+    }
+    if (s.k === "U32") {
+      const w = Bend.u32_from_term(s);
+      return w === null ? null : Bend.Lit("U32", w);
+    }
+    if (s.k === "SCon" || s.k === "SNil") {
+      const cs: number[] = [];
+      let r: HTerm = s;
+      for (; r.$ === "Ctr" && r.k === "SCon"; r = term_strip(r.x[1])) {
+        const c = term_strip(r.x[0]);
+        const u = c.$ === "Ctr" && c.k === "Chr" ? go(c.x[0]) : null;
+        if (u?.$ !== "Lit") {
+          return null;
+        }
+        cs.push(u.v);
+      }
+      const tail = r.$ === "Lit" && r.k === "String" ? [...r.v].map((c) =>
+        c.codePointAt(0)!) : r.$ === "Ctr" && r.k === "SNil" ? [] : null;
+      return tail && cs.length + tail.length <= 4 * LIT_SIZE
+        ? Bend.lit_of([...cs, ...tail]) : null;
+    }
+    const xs = s.x.map(go);
+    return xs.every((x) => x) ? Bend.Ctr(s.k, xs) : null;
+  };
+  return go(v);
+}
+
 // Clo
 // ===
 
@@ -1886,6 +2088,8 @@ function file_new(book: Bend.Book, js: boolean) {
     loops: new Map<Name, Name[]>(),
     flats: new Map<Name, boolean>(),
     made: Object.create(null) as Record<Name, Bend.Def>,
+    litk: new Map<string, Name | null>(),
+    litfuel: LIT_ALL,
     clos: new Map<Name, Map<string, Name | null>>(),
     clo_of: new Map<Name, { k: Name; n: number }>(),
     trees: new Map<Name, boolean>(),
@@ -4894,6 +5098,7 @@ export function compile_book(book: Bend.Book): string {
   LANE_SITES = [];
   FL = file_new(main_pure(book), false);
   clo_book(["main"]);
+  lit_book(["main"]);
   file_book(["main", ...RUNTIME_ADTS]);
   const us = c_units();
   const all = us.flatMap((u) => u.segs);
