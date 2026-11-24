@@ -6571,6 +6571,9 @@ ${segs}
     WL_DYN(f);
   }}
 
+  // A task's continuation is a heap task, made by code running in turns:
+  // on the host it runs so, as a scheduler that took it would (a drain
+  // task's sequence ends with the task).
   WL_CASE(FID_EXIT)
     u32  n = rn;
     Term rv[WL_RESW];
@@ -6587,7 +6590,7 @@ ${segs}
       u64 wa = term_loc(cont);
       u32 wn = fid_arity(wf);
       WL_FRAME(cont)
-      seq = (seq & 1) | fid_nofk(wf) << 1;
+      seq = (DEVICE ? seq & 1 : 0) | fid_nofk(wf) << 1;
       WL_ARGS(wa, wn - n)
       heap_free(e, cls_fit(wn + 2), wa);
       WL_TAKE(rv)
