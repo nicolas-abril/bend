@@ -83,7 +83,11 @@ type Of<K> = Extract<HTerm, { $: K }>;
 
 // A value's bounds over a spin's whole run, as C over the spin's entry
 // arguments; p and add say it is parameter word p's current value plus add.
-type Iv = { lo: string; hi: string; p?: number; add?: number };
+// p and add: parameter word p plus add; sp and st: parameter word sp
+// stepped by st, a self call's form ("@k" plus word k, "~c" minus c, "~@k"
+// minus word k)
+type Iv = { lo: string; hi: string; p?: number; add?: number; sp?: number;
+  st?: string };
 
 // A spin's index analysis: what each self call passes for each parameter
 // word (forms), the roles read off them, each variable's bounds, and the
@@ -93,7 +97,13 @@ type Iv = { lo: string; hi: string; p?: number; add?: number };
 type Ix = { forms: Map<number, Set<string>>; roles: string[] | null;
   info: Map<number, Iv>; conds: string[]; tmps: Map<string, string>;
   exs: Map<string, string>; outs: Map<string, Iv>; inl: number;
-  seen: boolean };
+  seen: boolean; lanes: Lane[]; wr?: boolean };
+
+// A countdown loop's lanes over an array (emit_lanes): the lane variable u,
+// the array words the turn hands b, b's result words that hold them, b's
+// spin and lane variant. ok: the loop's copy passed its check (lane_arrs).
+type Lane = { u: string; arrs: string[]; rets: string[]; end: string;
+  step: string; aj: number[]; uni: number[]; fid?: string; ok?: boolean };
 
 type Row = [HTerm, number, number, number];
 
@@ -3079,10 +3089,31 @@ function emit_lanes(sc: Scope, k: Name, ws: string[], ls: string[],
   const names = ls.map((l) => l.match(/^ *(?:Term|u32) (\w+) = [^;]*;$/)?.[1]);
   const preds = [...seg.als].filter(([, ex]) => ex === `(${p} - 1)`)
     .map(([al]) => al);
+  // In the mask-free copy (forms known): a counter every self call steps by
+  // the same constant is that much further on each later turn, and an array
+  // the loop hands b, which b only reads and the loop does not write (the
+  // copy's own check, lane_arrs), is the same array on each later turn.
+  const ix = FL.ix?.roles && k === b && !fact("type", "Array") ? FL.ix : null;
+  const ctrs = new Map(ix ? seg.params.flatMap((q, i) => {
+    const fs = [...ix.forms.get(i) ?? []];
+    const c = fs.length === 1 && seg.ks[i] === "w32"
+      && /^\+(\d+)$|^@(\d+)$/.exec(fs[0]);
+    return !c ? [] : c[1] ? [[q, `${c[1]}u`] as [string, string]]
+      : ix.roles![Number(c[2])] === "same" && seg.ks[Number(c[2])] === "w32"
+        ? [[q, seg.params[Number(c[2])]] as [string, string]] : [];
+  }) : []);
+  const arrs = kb.flatMap((kd, j) => kd === "box" ? [j] : []);
+  // one array: with two, clang leaves the lane step scalar (doitgen: 2.2x
+  // the instructions, 1.9x the cycles of no lanes)
+  const arr_ok = arrs.length === 0 || ix !== null && arrs.length === 1
+    && arrs.every((j) =>
+    seg.params.includes(ws[j]) && seg.ks[seg.params.indexOf(ws[j])] === "box");
   const ok = new Set([...names, ...preds, ...seg.params.filter((_, i) =>
-    !(st[i] & 6) && seg.ks[i] !== "box")]);
-  const text = [...ls, ...ws].join(" ");
-  if ([...fk.lays.flatMap((l) => l.ks), ...kb, ...fk.ret.ks].includes("box")
+    !(st[i] & 6) && seg.ks[i] !== "box"), ...ctrs.keys(),
+  ...arr_ok ? arrs.map((j) => ws[j]) : []]);
+  const text = [...ls, ...ws.filter((_, j) => !arrs.includes(j))].join(" ");
+  if ((arrs.length > 0 ? !arr_ok || k !== b
+    : [...fk.lays.flatMap((l) => l.ks), ...fk.ret.ks].includes("box"))
     || kb.length > 32 || !lay_eq(fk.ret, fb.ret) || fact("lane", b)
     || /\be\b/.test(text)
     || (text.match(/\b_\w+/g) ?? []).some((id) => !ok.has(id))) {
@@ -3094,28 +3125,53 @@ function emit_lanes(sc: Scope, k: Name, ws: string[], ls: string[],
   const each = (...lines: string[]) =>
     block(sc, `for (u32 l = 0; l < ${LANES}; l++) {`, () =>
       file_push(sc, ...lines));
-  const hit = `${u}n && ${u}b - (${p} - 1) < ${LANES}`;
+  const hit = `${u}n && ${u}b - (${p} - 1) < ${LANES}${arrs.map((j) =>
+    ` && ${ws[j]} == ${u}a${j}`).join("")}`;
+  const used = [...ctrs.keys()].filter((q) => new RegExp(`\\b${q}\\b`)
+    .test(text));
   const enter = (l: string, to: (j: number) => string) => [...preds.map(
-    (al) => `Term ${al} = ${p} - 1 - ${l};`), ...ls.map((x) => x.trim()),
+    (al) => `Term ${al} = ${p} - 1 - ${l};`), ...l === "0" ? [] : used.map((q) =>
+    `u32 ${q} = (u32)(${u}k_${q} + ${ctrs.get(q)} * ${l});`),
+  ...ls.map((x) => x.trim()),
     ...k === b ? q((j) => `${to(j).slice(1)} = ${ws[j]};`)
       : [`${emit_native(sc, k, b)}(${["e", u + "d", ...ws, ...q(to)]
         .join(", ")});`]];
   const step = emit_native(sc, b, b), end = emit_native(sc, b);
   const rn = fk.ret.ks.length;
+  // an array's lanes run once the loop's copy (lane_arrs) and b (lane_check)
+  // pass their checks: until then the gate reads 0
+  const gate = arrs.length > 0 ? `/*lanes ${u}*/` : "";
+  // there a word every lane enters with (it names no turn's own word) steps
+  // as one word for all lanes once lane_check sees b hand it on as it is
+  const own = new RegExp(`\\b(?:${[...preds, ...used, ...names.filter(
+    (x): x is string => !!x), "l"].join("|")})\\b`);
+  const uni = gate ? kb.flatMap((_, j) => j !== c && !arrs.includes(j)
+    && !own.test(ws[j]) ? [j] : []) : [];
+  if (gate) {
+    FL.ix!.lanes.push({ u, arrs: arrs.map((j) => ws[j]), end, step,
+      aj: arrs, uni,
+      rets: fb.ret.ks.flatMap((kd, j) => kd === "box" ? [`${o}[${j}]`] : []) });
+  }
   seg.pre.push("#if !DEVICE", `Term ${u}n = 0, ${u}b = 0, ${u}o[${LANES}][${
     rn}], ${u}d[${rn}];`, ...q((j) => `${lay_c(kb[j])} ${u}q${j}[${LANES}];`),
+    ...arrs.map((j) => `Term ${u}a${j} = 0;`),
     `u32 ${u}w = 0;`, `if (${p} >= ${LANES}) {`,
     ...seg_text([...q((j) => `${lay_c(kb[j])} ${u}s${j};`),
-      ...enter("0", (j) => `&${u}s${j}`), `${u}w = !__builtin_constant_p(${u}s${
-        c}) && ${u}s${c} >= ${LANE_MIN};`], 1), "}", "#endif");
+      ...enter("0", (j) => `&${u}s${j}`), `${u}w = ${gate ? `${gate}1 && ` : ""
+      }!__builtin_constant_p(${u}s${c}) && ${u}s${c} >= ${LANE_MIN};`], 1),
+    "}", "#endif");
   file_push(sc, "#if !DEVICE");
   block(sc, `if (${u}w && !(${hit}) && ${p} >= ${LANES}) {`, () => {
-    file_push(sc, `u32 ${u}e = 1;`);
+    file_push(sc, `u32 ${u}e = 1;`, ...used.map((q) => `u32 ${u}k_${q} = ${q};`),
+      ...arrs.map((j) => `${u}a${j} = ${ws[j]};`));
     each(...enter("l", (j) => `&${u}q${j}[l]`),
       `${u}e &= ${u}q${c}[l] == ${u}q${c}[0];`);
+    file_push(sc, ...uni.map((j) => `${lay_c(kb[j])} ${u}u${j} = ${u}q${j}[0];`));
     block(sc, `for (Term n = ${u}e ? ${u}q${c}[0] : 0; n != 0; n--) {`, () =>
       each(`${step}(${["e", u + "d", ...q((j) => j === c ? "n"
-        : `${u}q${j}[l]`), ...q((j) => `&${u}q${j}[l]`)].join(", ")});`));
+        : arrs.includes(j) ? `${u}a${j}` : uni.includes(j)
+          ? `/*uni ${u} ${j}*/${u}q${j}[l]` : `${u}q${j}[l]`),
+      ...q((j) => `&${u}q${j}[l]`)].join(", ")});`));
     each(`if (${end}(${["e", u + "o[l]", ...q((j) => `${u}q${j}[l]`)]
       .join(", ")}) == 0) {`, "  return 0;", "}");
     file_push(sc, `${u}b = ${p} - 1;`, `${u}n = 1;`);
@@ -3124,6 +3180,83 @@ function emit_lanes(sc: Scope, k: Name, ws: string[], ls: string[],
     `${o}[${j}] = ${u}o[${u}b - (${p} - 1)][${j}];`)));
   seg.lines.push(seg.lines.pop() + " else");
   file_push(sc, "#endif");
+}
+
+// The lanes over an array run only when nothing but b touches the array
+// in the loop's copy: each line naming it (or b's result word that holds it,
+// or a copy of either) copies it, calls b, takes its location for a read, or
+// is the lanes' own; no write goes through such a location.
+function lane_arrs(seg: Seg, l: Lane): boolean {
+  const lines = [...seg.pre, ...seg.lines];
+  const al = new Set([...l.arrs, ...l.rets]);
+  const copy = /^\s*(?:Term |u32 |u64 )?([\w[\]]+) = ([\w[\]]+);$/;
+  for (let n = -1; n !== al.size;) {
+    n = al.size;
+    lines.forEach((x) => {
+      const m = copy.exec(x);
+      m && al.has(m[2]) && al.add(m[1]);
+    });
+  }
+  const esc = (w: string) => w.replace(/[[\]]/g, "\\$&");
+  const names = new RegExp(`(?<![\\w])(?:${[...al].map(esc).join("|")
+    })(?![\\w[])`);
+  const own = new RegExp(`\\b${l.u}\\w*`);
+  const locs = new Set<string>();
+  return lines.every((x) => {
+    if (!names.test(x) || copy.test(x) || own.test(x)
+      || x.includes(`${l.end}(e, `)) {
+      return true;
+    }
+    const m = /^\s*Term (\w+) = blk_loc\(e\.mem, [\w[\]]+\);$/.exec(x);
+    return m !== null && locs.add(m[1]) !== null;
+  }) && !lines.some((x) => locs.has(/blk_write\(e\.mem, \w+, (\w+),/
+    .exec(x)?.[1] ?? ""));
+}
+
+function lane_gate(lines: string[], u: string, ok: boolean): void {
+  const g = `/*lanes ${u}*/1`;
+  lines.forEach((x, i) => lines[i] = ok ? x : x.replace(g, `/*lanes ${u}*/0`));
+}
+
+// b's side, once every spin is emitted: its spin and lane variant (and the
+// spins they call) read arrays and compute words, and call nothing else.
+function lane_check(spins: Seg[]): void {
+  const by = new Map(spins.map((s) => [s.fid, s]));
+  const pure = (f: string, seen: Set<string>): boolean => {
+    const s = by.get(f);
+    if (seen.has(f)) {
+      return true;
+    }
+    seen.add(f);
+    return s !== undefined && [...s.lines.slice(1).join("\n")
+      .matchAll(/\b([A-Za-z_]\w*)\s*\(/g)].every(([, c]) =>
+      /^(?:blk_(?:loc|read|at|cls)|f32_\w+|u32_\w+|U32_BIN|WL_\w+|clz|if|for|while|switch|return|HOT|sizeof)$/
+        .test(c) || /^(?:spin|lane)_\w+$/.test(c) && pure(c, seen));
+  };
+  // the lane step's j-th word out is its j-th word in, through copies
+  const same = (f: string, j: number): boolean => {
+    const lines = by.get(f)?.lines ?? [];
+    const set = new Map<string, Set<string>>();
+    lines.forEach((x) => {
+      const m = /^\s*(?:Term |u32 |u64 )?(\*?\w+) = (\w+);$/.exec(x);
+      m && m[2] !== "0" && memo(set, m[1], () => new Set()).add(m[2]);
+    });
+    const from = (w: string, n: number): boolean => w === `r${j}` || n > 0
+      && (set.get(w)?.size ?? 0) > 0 && [...set.get(w)!].every((y) =>
+        from(y, n - 1));
+    return from(`*lq${j}`, 16);
+  };
+  for (const l of LANE_SITES) {
+    const s = by.get(l.fid!);
+    if (s && l.ok && (fact("type", "Array") || !pure(l.end, new Set())
+      || !pure(l.step, new Set()) || !l.aj.every((j) => same(l.step, j)))) {
+      lane_gate(s.lines, l.u, false);
+    }
+    for (const j of s && l.ok ? l.uni.filter((j) => same(l.step, j)) : []) {
+      const w = `/*uni ${l.u} ${j}*/${l.u}q${j}[l]`;
+      s!.lines = s!.lines.map((x) => x.split(w).join(`${l.u}u${j}`));
+    }
+  }
 }
 
 // A foreign def's last parameter, past its live ones, is its continuation k.
@@ -3164,21 +3297,30 @@ function emit_native(sc: Scope, k: Name, to?: Name,
     };
     const ix: Ix = FL.ix = { forms: new Map(), roles: null, info: new Map(),
       conds: [], tmps: new Map(), exs: new Map(), outs: new Map(), inl: 0,
-      seen: false };
-    const seg = go();
+      seen: false, lanes: [] };
+    const first = go();
     // with helpers, the forms are read again off a pass that opens them
     const pass = () => {
       ix.info.clear();
       ix.outs.clear();
+      ix.lanes = [];
       ix.inl = ix.seen ? IX_INL : 0;
       return go();
     };
+    // a lane variant steps once: its helpers are emitted in place
+    const seg = to && !FL.js && ix.seen ? pass() : first;
     if (seg.spin && !FL.js && ix.seen) {
       ix.forms.clear();
       pass();
     }
     const bare = seg.spin && !FL.js && ix_roles(ix, seg) ? pass() : seg;
     FL.ix = null;
+    for (const l of bare === seg ? [] : ix.lanes) {
+      l.fid = name;
+      l.ok = ix.conds.length > 0 && lane_arrs(bare, l);
+      LANE_SITES.push(l);
+      lane_gate(bare.pre, l.u, l.ok);
+    }
     bare.refs.forEach((r) => seg.refs.add(r));
     // each copy opens with its own lanes (pre)
     const loop = (s: Seg, tab: number) => [...seg_text([...s.pre,
@@ -3211,7 +3353,7 @@ function emit_native(sc: Scope, k: Name, to?: Name,
     const head = `${q} Term ${name}(Env e, THR Term* o${seg.ks.map((kd, i) =>
       `, ${lay_c(kd)} r${i}` + (arr_q(kd) ? `, u64 q${i}` : "")).join("")}${
       to ? fun_of(to).lays.flatMap((l) => l.ks).map((kd, i) =>
-        `, THR ${lay_c(kd)}* q${i}`).join("") : ""})`;
+        `, THR ${lay_c(kd)}* lq${i}`).join("") : ""})`;
     FL.unit!.segs.push({ ...seg, head, lines: [head + " {", ...body] });
     const st = [...seg.st].map((x) => x ?? 0);
     if (to) {
@@ -3256,6 +3398,8 @@ const IX_MAX = "0xFFFFFFFFull";
 
 const IX_RUN = 16;
 
+let LANE_SITES: Lane[] = [];
+
 const IX_ANY: Iv = { lo: "0ull", hi: IX_MAX };
 
 const IX_INL = 32;
@@ -3298,9 +3442,18 @@ function ix_word(sc: Scope, w: string, sub = 0): Iv {
   if (role !== "down" && role !== "same") {
     // under an arm that took low successors off the countdown, that many
     // of its steps are still to come
-    const raw = ix_tmp(`${at} + ${role}ull * ${
-      less(ix_sat(`(u64)r${down}`), sc.low ?? 0)}`);
-    [lo, hi] = [ix_tmp(`(${raw} > ${IX_MAX} ? 0 : ${at})`), ix_sat(raw)];
+    const r = role.replace(/^~/, "");
+    const step = r[0] === "@" ? ix_sat(`(u64)r${r.slice(1)}`) : `${r}ull`;
+    const n = less(ix_sat(`(u64)r${down}`), sc.low ?? 0);
+    if (role[0] === "~") {
+      // down by step: under at by step times the steps to come, or wrapped
+      const raw = ix_tmp(`${step} * ${n}`);
+      [lo, hi] = [ix_tmp(`(${raw} > ${at} ? 0 : ${at} - ${raw})`),
+        ix_tmp(`(${raw} > ${at} ? ${IX_MAX} : ${at})`)];
+    } else {
+      const raw = ix_tmp(`${at} + ${step} * ${n}`);
+      [lo, hi] = [ix_tmp(`(${raw} > ${IX_MAX} ? 0 : ${at})`), ix_sat(raw)];
+    }
   }
   return { lo: sub === 0 ? lo : ix_tmp(`(${lo} > ${sub} ? ${lo} - ${sub} : 0)`),
     hi: less(hi, sub), p, add: -sub };
@@ -3371,18 +3524,24 @@ function iv(sc: Scope, tm: HTerm): Iv {
     lo: ix_tmp(`(${a.lo} ${o} ${b.lo} ? ${a.lo} : ${b.lo})`),
     hi: ix_tmp(`(${a.hi} ${o} ${b.hi} ? ${a.hi} : ${b.hi})`) });
   const top = (hi: string): Iv => ({ lo: "0ull", hi: ix_tmp(hi) });
+  // a word down by a constant or by another word
+  const c = /^(\d+)ull$/.exec(b.hi);
+  const down = k !== "U32.sub" || a.p === undefined || a.add !== 0 ? {}
+    : c && b.lo === b.hi ? { sp: a.p, st: "~" + c[1] }
+    : b.p !== undefined && b.add === 0 ? { sp: a.p, st: "~@" + b.p } : {};
   // no bound in, none out: a check that cannot hold asks for no copy
   if ((a.hi === IX_MAX || m.args[1] && b.hi === IX_MAX)
     && /\.(sub|x?or|max|shln|shr)$/.test(k)) {
-    return IX_ANY;
+    return { ...IX_ANY, ...down };
   }
   switch (k) {
     case "U32.add":
     case "Nat.add": {
-      const c = /^(\d+)ull$/.exec(b.hi);
+      const by = k === "U32.add" && !c && a.p !== undefined && a.add === 0
+        && b.p !== undefined && b.add === 0 ? { sp: a.p, st: "@" + b.p } : {};
       return { ...sum(a, b, "+"), ...a.p !== undefined && c
         && b.lo === b.hi && a.add! >= 0
-        ? { p: a.p, add: a.add! + Number(c[1]) } : {} };
+        ? { p: a.p, add: a.add! + Number(c[1]) } : by };
     }
     case "U32.inc": {
       return { ...sum(a, one, "+"), ...a.p !== undefined && a.add! >= 0
@@ -3399,7 +3558,7 @@ function iv(sc: Scope, tm: HTerm): Iv {
     case "U32.sub": {
       const ok = ix_tmp(`${a.lo} >= ${b.hi}`);
       return { lo: ix_tmp(`(${ok} ? ${a.lo} - ${b.hi} : 0)`),
-        hi: ix_tmp(`(${ok} ? ${a.hi} - ${b.lo} : ${IX_MAX})`) };
+        hi: ix_tmp(`(${ok} ? ${a.hi} - ${b.lo} : ${IX_MAX})`), ...down };
     }
     case "Nat.sub": {
       return { lo: ix_tmp(`(${a.lo} > ${b.hi} ? ${a.lo} - ${b.hi} : 0)`),
@@ -3466,8 +3625,11 @@ function ix_forms(sc: Scope, ck: Spine, vals: Val[]): void {
     vals[i].ws.forEach((word, j) => {
       // a word of a record, or of a helper's result, is read by its name
       const g = j === 0 && got.p !== undefined ? got : ix_word(sc, word);
-      memo(FL.ix!.forms, w, () => new Set()).add(g.p !== w++ ? "?"
-        : g.add! > 0 ? "+" + g.add : String(g.add));
+      // itself stepped by another word, or down by a constant
+      const st = j === 0 && got.sp === w ? got.st : undefined;
+      memo(FL.ix!.forms, w, () => new Set()).add(st ?? (g.p !== w ? "?"
+        : g.add! > 0 ? "+" + g.add : String(g.add)));
+      w++;
     });
   });
 }
@@ -3480,8 +3642,14 @@ function ix_roles(ix: Ix, seg: Seg): boolean {
       : fs.every((f) => f[0] === "-" && f !== "-0") && seg.ks[p] === "w64"
       ? "down"
       : up.length > 0 && new Set(up).size === 1 && seg.ks[p] === "w32"
-        && fs.every((f) => f === "0" || f[0] === "+") ? up[0].slice(1) : "";
+        && fs.every((f) => f === "0" || f[0] === "+") ? up[0].slice(1)
+      : new Set(fs.filter((f) => f !== "0")).size === 1 && seg.ks[p] === "w32"
+        && /^~?@\d+$|^~\d+$/.test(fs.find((f) => f !== "0")!)
+        ? fs.find((f) => f !== "0")! : "";
   });
+  // a counter stepped by another word needs that word fixed for the loop
+  ix.roles = ix.roles.map((r) => /@/.test(r)
+    && ix.roles![Number(r.replace(/^~?@/, ""))] !== "same" ? "" : r);
   ix.info.clear();
   return ix.roles.includes("down");
 }
@@ -3489,14 +3657,24 @@ function ix_roles(ix: Ix, seg: Seg): boolean {
 // The index of an access to a fixed array has a bound: the mask-free copy
 // needs it under the array's size, and reads the index as it is.
 function ix_site(sc: Scope, k: Name, m: Spine): boolean {
+  if (FL.ix && sc.seg.native && /^Array\.(set|swap)$/.test(k)) {
+    FL.ix.wr = true;
+  }
   if (!FL.ix?.roles || !sc.seg.native
     || !/^Array\.(get|set|swap)$/.test(k)) {
     return false;
   }
   const arr = iv(sc, m.args[0]);
   const at = iv(sc, m.args[1]);
+  // in a loop that writes, an access along a word's stride stays masked:
+  // bare, syrk's column read beside its row update ran 1.2x the cycles (an
+  // extra op on the address gives the masked speed back) and deriche's
+  // filters 1.1x the instructions (clang keeps their F32 coefficients in
+  // integer registers once the loop has two copies)
+  const stride = FL.ix.wr && at.p !== undefined
+    && /@/.test(FL.ix.roles[at.p]);
   if (arr.p === undefined || FL.ix.roles[arr.p] !== "same"
-    || at.hi === IX_MAX) {
+    || at.hi === IX_MAX || stride) {
     return false;
   }
   FL.ix.conds.push(`${at.hi} < (1ull << (blk_cls(r${arr.p}) - ${
@@ -3828,7 +4006,8 @@ function emit_let(sc: Scope, x: Of<"Let">): void {
   if (FL.ix) {
     const got = iv(sc, x.v[0]);
     FL.ix.info.set(o.ps[0].i, got.hi === IX_MAX && got.p === undefined
-      && v.ws.length === 1 ? ix_word(sc, v.ws[0]) : got);
+      && got.sp === undefined && v.ws.length === 1
+      ? ix_word(sc, v.ws[0]) : got);
   }
   bind_uses(sc, o.ps[0], v, [o.b], ty_ann(x.v[0])!);
 }
@@ -3891,7 +4070,7 @@ function emit_body(sc: Scope, tm: HTerm, ty0: HTerm | null, args: Val[],
       if (sc.seg.lane === ck.k) {
         const ws = emit_args(sc, ck, true).flatMap((v) => v.ws);
         spare_flush(sc);
-        return file_push(sc, ...ws.map((w, i) => `*q${i} = ${w};`),
+        return file_push(sc, ...ws.map((w, i) => `*lq${i} = ${w};`),
           "return 2;");
       }
       const { h, ret } = fun_of(ck.k);
@@ -4657,6 +4836,7 @@ function segs_fuse(segs: Seg[], dev: Set<string>): Seg[] {
 }
 
 export function compile_book(book: Bend.Book): string {
+  LANE_SITES = [];
   FL = file_new(main_pure(book), false);
   clo_book(["main"]);
   file_book(["main", ...RUNTIME_ADTS]);
@@ -4671,6 +4851,7 @@ export function compile_book(book: Bend.Book): string {
   const dev = reach([...[...FL.bangs].map(seg_fid), ...wide ? clos : []]);
   const segs = segs_fuse(all.filter((s) => !s.native && live.has(s.fid)), dev);
   const spins = all.filter((s) => s.native && live.has(s.fid));
+  lane_check(spins);
   segs_base(segs, dev);
   const tabs = c_header(segs, clos);
   // a spin may call one defined after it
