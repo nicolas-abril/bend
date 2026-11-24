@@ -466,9 +466,10 @@ function term_spine(tm: HTerm): Spine {
   });
 }
 
-function term_eta(t: HTerm, T: HTerm, n: number): HTerm {
-  return n === 0 ? t : Bend.Ann(Bend.Lam("x", 0, (y: HTerm) =>
-    term_eta(Bend.App(t, y), ty_all(T).B(y), n - 1)), T);
+// named: the params take T's names, as a def's own do
+function term_eta(t: HTerm, T: HTerm, n: number, named = false): HTerm {
+  return n === 0 ? t : Bend.Ann(Bend.Lam(named ? ty_all(T).k : "x", 0,
+    (y: HTerm) => term_eta(Bend.App(t, y), ty_all(T).B(y), n - 1, named)), T);
 }
 
 function call_eta(t: HTerm): HTerm | null {
@@ -669,7 +670,7 @@ function ty_key(T: HTerm): string {
 }
 
 function tld_of(k: Name): Bend.TLD {
-  return FL.book.tlds[k];
+  return FL.book.tlds[k] ?? FL.made[k];
 }
 
 function ty_tag(t: HTerm | null, tags: string): boolean {
@@ -1095,6 +1096,91 @@ function loop_of(k: Name): Name[] {
   return memo(FL.loops, k, () => (visit(k), FL.loops.get(k)!));
 }
 
+// A def that answers a Nat or a U32 and calls itself outside a tail goes on
+// in d~acc, which takes the sum so far first, if every such call is an
+// operand of a tail add: there, under successors, or bound by a let used
+// once. The other operands join the sum, bound before the calls, each call
+// takes it in turn (the last as a tail call), and any other answer is added
+// to it: no part of a sum of Nats passes the whole, and U32 wraps. d calls
+// d~acc with 0. A def in a tail cycle with another keeps its tail calls.
+// loop_of opens d's body, so a let's probe is past every index term_lower
+// gives.
+function acc_def(d: Name): void {
+  const f = fun_of(d);
+  const { T } = tld_of(d) as Bend.Def;
+  const R = ty_adt(tele_fill(T, Array(f.n).fill(DUMMY)));
+  const op = R?.k + ".add";
+  const w = d + "~acc";
+  if (FL.js || !intr_of(op) || R!.k === "F32" || f.lays.length >= WIDE
+    || !term_any(f.h!, (s, tail) => !tail && term_spine(s).k === d)
+    || loop_of(d).length > 1) {
+    return;
+  }
+  const go = (t: HTerm, a: HTerm, env: Map<number, Spine>): any => {
+    const s = term_force(t);
+    const on = (x: HTerm) => go(x, a, env);
+    if (s.$ === "Lam") {
+      return { ...s, f: (x: HTerm) => on(s.f(x)) };
+    }
+    if (s.$ === "Let") {
+      const o = term_open(s);
+      const m = term_spine(s.v[0]);
+      const one = s.k.length === 1 && m.k === d && !m.b
+        && rest_use([o.b], o.ps[0]) === 1;
+      return { ...s, f: (xs: Of<"Var">[]) => go(s.f(xs), a,
+        one ? new Map(env).set(xs[0].i, m) : env) };
+    }
+    if (s.$ === "Mat") {
+      return { ...s, h: on(s.h), m: on(s.m) };
+    }
+    if (s.$ === "Ann") {
+      return { ...s, x: on(s.x) };
+    }
+    if (s.$ === "Rwt") {
+      return { ...s, f: on(s.f) };
+    }
+    if (s.$ === "Efq") {
+      return s;
+    }
+    const cs: Spine[] = [];
+    const flat = (x: HTerm): void => {
+      const y = term_strip(x);
+      const m = term_spine(y);
+      const [b, n] = y.$ === "Ctr" && y.k === "Succ" ? nat_peel(y) : [null, 0];
+      const c = m.k === d && !m.b ? m : y.$ === "Var" && env.get(y.i);
+      if (b !== null) {
+        flat(b);
+        flat(Bend.Lit("Nat", n));
+      } else if (m.t.$ === "Ref" && m.t.k === op) {
+        m.args.forEach(flat);
+      } else if (c) {
+        cs.push(c);
+      } else if (!term_const(y)
+        || (Bend.u32_from_term(y) ?? nat_peel(y)[1]) !== 0) {
+        // a literal 0 adds nothing: the sum goes on as it is, untested
+        a = Bend.Ann(Bend.App(Bend.App(Bend.Ref(op), a), Bend.Ann(x, R!)), R!);
+      }
+    };
+    flat(s);
+    return cs.length === 0 ? a : Bend.Let(["a"], [0], [Bend.Ann(a, R!)],
+      (xs: HTerm[]) => cs.reduce((a, m) => Bend.Ann(m.all.reduce((g, x) =>
+        Bend.App(g, x), Bend.App(Bend.Ref(w), a)), R!), xs[0]));
+  };
+  // the types in d's body name its params by level: lowered and raised
+  // again first, they follow the params when acc goes in front of them
+  const h = Bend.term_higher(Bend.term_lower(f.h!));
+  const e = Bend.term_lower(Bend.Lam("acc", 0, (a: HTerm) =>
+    go(h, a, new Map())));
+  const v = Bend.term_higher(e);
+  if (!term_any(v, (s) => s.$ === "Ref" && s.k === d)) {
+    FL.made[w] = { $: "Def", n: f.n + 1, x: 0, v, e,
+      T: Bend.All(Bend.Many(), "acc", 0, R!, () => T) };
+    // a type var of d's own params reads as one only by T's name and level
+    f.h = Bend.term_higher(Bend.term_lower(term_eta(Bend.App(Bend.Ref(w),
+      Bend.Lit(R!.k as "Nat", 0)), T, f.n, true)));
+  }
+}
+
 function flat_of(k: Name): boolean {
   return memo(FL.flats, k, () => {
     const deps = FL.srcs.get(k);
@@ -1148,6 +1234,7 @@ function file_new(book: Bend.Book, js: boolean) {
     srcs: new Map<Name, Set<Name> | null>(),
     loops: new Map<Name, Name[]>(),
     flats: new Map<Name, boolean>(),
+    made: Object.create(null) as Record<Name, Bend.Def>,
     funs: new Map<Name, Fun>(),
     nodes: new Map<Name, Lay>(),
     lays: new Map<string, Lay>(),
@@ -1227,6 +1314,7 @@ function file_book(roots: Name[]): void {
     if (!done_live(tld)) {
       continue;
     }
+    acc_def(d);
     const deps = new Set<Name>();
     let flat = true;
     term_any(fun_of(d).h!, (s, tail) => {
