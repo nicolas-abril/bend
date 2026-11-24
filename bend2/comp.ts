@@ -7155,6 +7155,14 @@ static void* pool_mmap(u64 bytes) {
   return p;
 }
 
+// A thread's allocator counts start at ALC_NONE: each thread sets its own row
+// when it starts, so a run touches the rows of the threads it has.
+static void alc_open(u64* alc) {
+  for (u32 c = 0; c < NCLS_ALL; c += 1) {
+    alc[NCLS_ALL + c] = ALC_NONE;
+  }
+}
+
 static Term* pool_stack(void) {
   u64   len = 1ull << 31;
   u64   alt = 4 * SIGSTKSZ;
@@ -7232,6 +7240,7 @@ static u32 pool_rows(Env e, DEV Term* stk) {
 
 static void* pool_work(void* arg) {
   Term* stk  = pool_stack();
+  alc_open(ALC[(uintptr_t)arg]);
   fk_init(ALC[(uintptr_t)arg], (u32)(uintptr_t)arg);
   u32   seen = 0;
   for (;;) {
@@ -7246,6 +7255,7 @@ OUTLINE void pool_open(void) {
     return;
   }
   up = true;
+  fk_init(ALC[0], 0);
   for (u32 w = 1; w < pool_size; w += 1) {
     pthread_t tid;
     if (pthread_create(&tid, NULL, pool_work, (void*)(uintptr_t)w)) {
@@ -7762,9 +7772,7 @@ static bool corpus_grow(u64* H, u64 need) {
 static u64* corpus_setup(bool gpu, long threads, u64 bytes) {
   io_gpu     = gpu;
   KEEP_WORDS = gpu ? CHUNK : CAP_WORDS;
-  for (u32 i = 0; i < CUBE_T * NCLS_ALL; i += 1) {
-    ALC[i / NCLS_ALL][NCLS_ALL + i % NCLS_ALL] = ALC_NONE;
-  }
+  alc_open(ALC[0]);
   u64 size   = (!gpu ? 1ull << 33 : bytes != 0 ? bytes : gpu_span())
     & ~16383ull;
   CORPUS     = gpu ? gpu_map(size) : corpus_map(size);
@@ -8150,6 +8158,10 @@ static Term io_work(IoWork* w, IoCall call, IoPack pack) {
   w->pack  = pack;
   io_busy += 1;
   if (io_busy > io_size && io_size < IO_HELP) {
+    if (io_size == 0 && (pipe(io_wake_fd)
+      || fcntl(io_wake_fd[0], F_SETFL, O_NONBLOCK))) {
+      err_fail("the event loop failed to open");
+    }
     pthread_t tid;
     if (pthread_create(&tid, NULL, io_help, NULL)) {
       err_fail("pthread_create");
@@ -8171,7 +8183,7 @@ static bool io_bit(u8* set, int fd, bool put) {
 }
 
 static void io_wait(Env e, bool block) {
-  int top  = io_wake_fd[0];
+  int top  = io_size != 0 ? io_wake_fd[0] : 0;
   u64 soon = io_park != NULL ? io_park->next->time : 0;
   io_parked(a) {
     if (a->evts != 0 && (int)a->word > top) {
@@ -8180,7 +8192,7 @@ static void io_wait(Env e, bool block) {
   }
   u64 len = (u64)top / 64 * 8 + 8;
   u8* set = io_mem(calloc(2, len));
-  io_bit(set, io_wake_fd[0], true);
+  io_bit(set, io_wake_fd[0], io_size != 0);
   io_parked(a) {
     if (a->evts != 0) {
       io_bit(set + (a->evts == POLLOUT) * len, (int)a->word, true);
@@ -8197,7 +8209,7 @@ static void io_wait(Env e, bool block) {
     }
     memset(set, 0, 2 * len);
   }
-  if (io_bit(set, io_wake_fd[0], false)) {
+  if (io_size != 0 && io_bit(set, io_wake_fd[0], false)) {
     io_take(e);
   }
   u64     now  = io_tick();
@@ -8311,11 +8323,7 @@ static void io_step(Env e, IoWork* a) {
 OUTLINE void io_loop(u64* H) {
   Env e = { H, ALC[0] };
   io_stk = pool_stack();
-  fk_init(ALC[0], 0);
   signal(SIGPIPE, SIG_IGN);
-  if (pipe(io_wake_fd) || fcntl(io_wake_fd[0], F_SETFL, O_NONBLOCK)) {
-    err_fail("the event loop failed to open");
-  }
   Term m = corpus_eval(H, term_tsk(MAIN_FID, task_node(e, MAIN_FID,
     TERM_HOLE, 0, 0)));
   io_spawn(m);
