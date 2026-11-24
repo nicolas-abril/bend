@@ -2791,9 +2791,14 @@ function seg_base(s: Seg): string[] | null {
   return out && [...seg_take(s), ...out];
 }
 
-function segs_base(segs: Seg[]): void {
+// On the device (segments in dev) a frame is pushed, id and all, where the
+// call is, before the callee's arguments: the answering arms are host-only,
+// and a push below the arguments keeps them and the frame live at once there
+// (GPU time +19% on respelled queens r3).
+function segs_base(segs: Seg[], dev: Set<string>): void {
   const arms = new Map(segs.map((s) => [s.fid, seg_base(s)]));
   for (const { fid, lines: ls } of segs) {
+    const gpu = dev.has(fid);
     for (let i = ls.length; i-- > 0;) {
       const m = ls[i].match(/^( *)\/\/base (\S+) (\S+) (\d+) (.+)$/);
       const b = m && arms.get(m[2]);
@@ -2827,8 +2832,14 @@ function segs_base(segs: Seg[]): void {
             `    ${lay_c(k.ks[j])} ${p} = ${j < at.length ? ws[at[j]]
               : rs[j - at.length]};`), "    WL_OPEN",
           ...k.lines.map((x) => "    " + x), "  }}", "}"], m[1].length / 2),
-          ...ls.slice(r - 1, e), m[1] + "}");
-        ls.splice(r, e - r);
+          ...gpu ? ["#if !DEVICE"] : [], ...ls.slice(r - 1, e), m[1] + "}",
+          ...gpu ? ["#endif"] : []);
+        if (gpu) {
+          ls.splice(e, 0, "#endif");
+          ls.splice(r, 0, "#if DEVICE");
+        } else {
+          ls.splice(r, e - r);
+        }
         i = r;
         continue;
       }
@@ -2836,13 +2847,16 @@ function segs_base(segs: Seg[]): void {
         ls.splice(i, 1, ...b ? seg_text([`if (!DEVICE && ${m[5]}) {`,
           ...b.map((x) => "  " + x.replace(/WL_RETN\(\d+\);/,
             `${own ? "WL_POPN(1); " : ""}WL_JMP(${m[3]});`)), "}",
-          ...own ? [] : [`if (${m[5]}) {`, `  STK(0) = ${m[3]};`,
-            "  WL_PUSHN(1);", "}"]], m[1].length / 2) : []);
+          ...own ? [] : [...gpu ? ["#if !DEVICE"] : [], `if (${m[5]}) {`,
+            `  STK(0) = ${m[3]};`, "  WL_PUSHN(1);", "}",
+            ...gpu ? ["#endif"] : []]], m[1].length / 2) : []);
       }
       if (b && !own) {
         let at = i;
         while (ls[--at].trim() !== `STK(${m![4]}) = ${m![3]};`);
-        ls.splice(at, 2, ls[at + 1].replace(/\d+/, m![4]));
+        const host = ls[at + 1].replace(/\d+/, m![4]);
+        ls.splice(at, 2, ...gpu
+          ? ["#if DEVICE", ls[at], ls[at + 1], "#else", host, "#endif"] : [host]);
       }
     }
   }
@@ -2919,7 +2933,7 @@ export function compile_book(book: Bend.Book): string {
   const dev = reach([...[...FL.bangs].map(seg_fid), ...wide ? clos : []]);
   const segs = all.filter((s) => !s.native && live.has(s.fid));
   const spins = all.filter((s) => s.native && live.has(s.fid));
-  segs_base(segs);
+  segs_base(segs, dev);
   const tabs = c_header(segs, clos);
   // a spin may call one defined after it
   const img = [`CONSTV u64 STAT_IMG[] = { ${FL.img.join(", ") || 0} };`,
