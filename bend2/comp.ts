@@ -1881,6 +1881,7 @@ function file_new(book: Bend.Book, js: boolean) {
     book,
     js,
     bangs: new Set<Name>(),
+    eager: new Set<string>(),
     sites: new Map<Name, number>(),
     srcs: new Map<Name, Set<Name> | null>(),
     loops: new Map<Name, Name[]>(),
@@ -2833,6 +2834,7 @@ function emit_jump(sc: Scope, args: string[], k: Name, bang = false,
       : FL.rets.has(k) && fact_add("rown", k);
   }
   sc.seg.fork ||= bang;
+  bang && FL.eager.add(sc.seg.fid);
   if (bang || sc.seg.def !== k) {
     block(sc, `if (${bang ? "!seq"
       : `!DEVICE && !WL_SEQ(${sc.seg.fid}) && fid_nofk(${fid})`}) {`, () =>
@@ -4177,6 +4179,7 @@ function emit_fork(sc: Scope, x: Of<"Let">): void {
   // a task (the s segment, on that frame) and the frame's continuation into
   // the w segment, which waits for the task's result.
   const lazy = !FL.js && calls.length === 2 && !calls.some((c) => c.b);
+  fork && !lazy && FL.eager.add(sc.seg.fid);
   const sname = lazy ? seg_name("s") : "";
   let k1: [Scope, Seg["frame"], [Of<"Var">, Bind][], Val, HTerm[]] | null = null;
   calls.forEach((c, i) => {
@@ -4906,11 +4909,33 @@ export function compile_book(book: Bend.Book): string {
   const dev = reach([...[...FL.bangs].map(seg_fid), ...wide ? clos : []]);
   const segs = segs_fuse(all.filter((s) => !s.native && live.has(s.fid)), dev);
   const spins = all.filter((s) => s.native && live.has(s.fid));
+  // With lazy forks, an outer spin (one only segments call) whose step
+  // runs another spin polls the hungry pool at each step: a light step
+  // would pay the test, and clang could no longer fold its loop. With such
+  // a spin and no other forks, a turn with idle threads starts with no grow
+  // (Lazy forks).
+  const host = all.filter((s) => !s.native && live.has(s.fid));
+  let only = false;
+  if (host.some((s) => s.lines.some((l) => l.includes("WL_FKNOTE(")))) {
+    const calls = (ss: Seg[], f: string) => ss.some((s) => s.fid !== f
+      && s.lines.some((l) => l.includes(f + "(")));
+    for (const s of spins) {
+      const inner = s.lines.slice(1).join("\n").match(/\bspin_\w+\(/g) ?? [];
+      if (calls(host, s.fid) && !calls(spins, s.fid)
+        && inner.some((c) => c !== s.fid + "(")
+        && s.lines.some((l) => /\bWL_SPIN\b/.test(l))) {
+        s.lines = s.lines.map((l) => l.replace(/\bWL_SPIN\b/, "WL_POLL"));
+        only = true;
+      }
+    }
+    only &&= !host.some((s) => FL.eager.has(s.fid));
+  }
   lane_check(spins);
   segs_base(segs, dev);
   const tabs = c_header(segs, clos);
   // a spin may call one defined after it
-  const img = [`CONSTV u64 STAT_IMG[] = { ${FL.img.join(", ") || 0} };`,
+  const img = [...only ? ["#define FK_DRAIN 1"] : [],
+    `CONSTV u64 STAT_IMG[] = { ${FL.img.join(", ") || 0} };`,
     spins.map((s) => s.head + ";").join("\n"),
     ...spins.map((s) => s.lines.join("\n"))].join("\n\n");
   const text = segs.map((seg) => {
@@ -6554,6 +6579,21 @@ static u32 root_take(DEV u64* H, THR Term* v) {
 // Spins
 // =====
 
+// Under lazy forks a spin a segment calls (WL_POLL) tests at each step
+// whether a thread hunts while this one holds an unsplit note; if so,
+// fk_spin may split one (Lazy forks).
+#if DEVICE
+#define WL_POLL WL_SPIN
+#else
+static u32 fk_hungry;
+OUTLINE void fk_spin(Env e);
+#define WL_POLL for (;;) { \
+  if (__builtin_expect(a32_load(&fk_hungry) != 0, 0) \
+    && e.alc[FK_LOW] < e.alc[FK_TOP]) { \
+    fk_spin(e); \
+  }
+#endif
+
 ${spins}
 
 // Work
@@ -6598,7 +6638,6 @@ typedef struct { DEV Term* at; u32 site; u32 slot; Term task; Term fut; } FkEnt;
 static void* pool_mmap(u64 bytes);
 
 #define FK_SLOTS 64
-static u32  fk_hungry;
 static u32  fk_boxed;
 static u32  fk_hunters;
 static u32  fk_sleepers;
@@ -6658,16 +6697,17 @@ static Term fk_take(Env e) {
   return 0;
 }
 
-// The thread's oldest unsplit frame below its newest (whose frame may not
-// be written yet) becomes a task, at most once per FK_GAP ns of a thread:
+// The thread's oldest unsplit frame becomes a task, below its newest (whose
+// frame may not be written yet) but in a spin, at most once per FK_GAP ns of
+// a thread:
 // tasks too small to be worth a split would otherwise be split at every
 // fork while a drain's tail is hungry.
 #define FK_GAP 20000
 static u64 io_tick(void);
 
-FAR void fk_poll(Env e) {
+FAR void fk_poll(Env e, u32 spin) {
   FkEnt* lo   = (FkEnt*)e.alc[FK_LOW];
-  FkEnt* hi   = (FkEnt*)e.alc[FK_TOP] - 1;
+  FkEnt* hi   = (FkEnt*)e.alc[FK_TOP] - !spin;
   u64    bits = e.alc[FK_BITS];
   if (lo >= hi || ~bits == 0 || err_seen(e.mem)) {
     return;
@@ -6676,13 +6716,15 @@ FAR void fk_poll(Env e) {
   if (now < e.alc[FK_NEXT]) {
     return;
   }
-  e.alc[FK_NEXT] = now + FK_GAP;
+  // a spin in the s segment polls too: no split inside this one
+  e.alc[FK_NEXT] = ~0ull;
   u32 me   = (u32)e.alc[FK_ME];
   u32 slot = __builtin_ctzll(~bits);
   e.alc[FK_LOW]  = (u64)(lo + 1);
   e.alc[FK_BITS] = bits | 1ull << slot;
   Term fut = term_tsk(FID(Fk~fut), task_node(e, FID(Fk~fut), TERM_HOLE, 0, 1));
   Term t   = fk_call(e, lo->at, lo->site, fut);
+  e.alc[FK_NEXT] = now + FK_GAP;
   lo->slot = slot;
   lo->task = t;
   lo->fut  = fut;
@@ -6725,7 +6767,13 @@ INLINE void fk_note(Env e, DEV Term* at, u32 site) {
   t->site = site;
   e.alc[FK_TOP] = (u64)(t + 1);
   if (a32_load(&fk_hungry) > a32_load(&fk_boxed)) {
-    fk_poll(e);
+    fk_poll(e, 0);
+  }
+}
+
+OUTLINE void fk_spin(Env e) {
+  if (a32_load(&fk_hungry) > a32_load(&fk_boxed)) {
+    fk_poll(e, 1);
   }
 }
 
@@ -7681,11 +7729,16 @@ static void cube_run(u64* H, bool gpu) {
     } else {
       u32 rows = f;
       u32 want = (pool_size - 1) / (CUBE_T / LINE) + 1;
+#ifdef FK_DRAIN
+      // every fork splits lazily and leaf spins poll, so a drain spreads
+      // the work: a grow would run whole leaves while threads idle
+      want = f < pool_size ? 0 : want;
+#endif
       if (f < want) {
         u32 cur = row_grow((Env){ H, ALC[0] }, io_stk, 0, CUBE_G, want, f);
         rows = cur > f ? cur : f;
       }
-      for (u32 g = f; g != 0 && f < CUBE;
+      for (u32 g = f; want != 0 && g != 0 && f < CUBE;
         g = turn_take(H)) {
         rows = g > rows ? g : rows;
         pool_turn(true, rows);
