@@ -4910,23 +4910,25 @@ export function compile_book(book: Bend.Book): string {
   const segs = segs_fuse(all.filter((s) => !s.native && live.has(s.fid)), dev);
   const spins = all.filter((s) => s.native && live.has(s.fid));
   // With lazy forks, an outer spin (one only segments call) whose step
-  // runs another spin polls the hungry pool at each step: a light step
-  // would pay the test, and clang could no longer fold its loop. With such
-  // a spin and no other forks, a turn with idle threads starts with no grow
-  // (Lazy forks).
+  // runs a loop (a spin that loops or calls one) polls the hungry pool at
+  // each step: a light step would pay the test, and clang could no longer
+  // fold or widen its loop. With such a spin and no other forks, a turn
+  // with idle threads starts with no grow (Lazy forks).
   const host = all.filter((s) => !s.native && live.has(s.fid));
   let only = false;
   if (host.some((s) => s.lines.some((l) => l.includes("WL_FKNOTE(")))) {
     const calls = (ss: Seg[], f: string) => ss.some((s) => s.fid !== f
       && s.lines.some((l) => l.includes(f + "(")));
-    for (const s of spins) {
-      const inner = s.lines.slice(1).join("\n").match(/\bspin_\w+\(/g) ?? [];
-      if (calls(host, s.fid) && !calls(spins, s.fid)
-        && inner.some((c) => c !== s.fid + "(")
-        && s.lines.some((l) => /\bWL_SPIN\b/.test(l))) {
-        s.lines = s.lines.map((l) => l.replace(/\bWL_SPIN\b/, "WL_POLL"));
-        only = true;
-      }
+    const loops = (s: Seg) => s.lines.some((l) => /\bWL_SPIN\b/.test(l));
+    const inner = (s: Seg) => spins.filter((t) => t.fid !== s.fid
+      && s.lines.slice(1).some((l) => l.includes(t.fid + "(")));
+    const heavy = new Map<string, boolean>();
+    const runs = (s: Seg): boolean => heavy.get(s.fid) ?? (heavy.set(s.fid,
+      false), heavy.set(s.fid, loops(s) || inner(s).some(runs)).get(s.fid)!);
+    for (const s of spins.filter((s) => calls(host, s.fid)
+      && !calls(spins, s.fid) && loops(s) && inner(s).some(runs))) {
+      s.lines = s.lines.map((l) => l.replace(/\bWL_SPIN\b/, "WL_POLL"));
+      only = true;
     }
     only &&= !host.some((s) => FL.eager.has(s.fid));
   }
