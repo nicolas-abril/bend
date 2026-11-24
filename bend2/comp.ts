@@ -19,7 +19,7 @@ type Kind = "w32" | "w64" | "box";
 type Lay = { ks: Kind[]; arms: Record<Name, Lay[]> | null };
 
 type Val = { ws: string[]; lay: Lay; stat: boolean; rs: (string | null)[];
-  iv?: Iv };
+  iv?: Iv; nv?: Nv; sink?: boolean };
 
 type Bind = { val: Val; n: number; A: HTerm };
 
@@ -1906,6 +1906,7 @@ function file_new(book: Bend.Book, js: boolean) {
     cand: new Map<Name, Set<string>>(),
     rets: new Map<Name, number>(),
     ix: null as Ix | null,
+    nv: null as NvBook | null,
     heat: new Set<string>(),
     when: new Map<string, (() => void)[]>(),
     units: new Map<string, Unit>(),
@@ -2253,8 +2254,79 @@ function val_arm(v: Val, k = Object.keys(v.lay.arms!)[0]): Val[] {
 }
 
 function val_hold(sc: Scope, v: Val, k: string): Val {
-  return val_new(v.ws.map((w, j) => emit_alias(sc, w, k, v.lay.ks[j])),
-    v.lay, v.rs);
+  return nv_keep(val_new(v.ws.map((w, j) => emit_alias(sc, w, k,
+    v.lay.ks[j])), v.lay, v.rs), v);
+}
+
+// Base's Nat.div or Nat.mod by a variable whose bounds keep it off zero is
+// the bare division: no test for the zero divisor.
+function nv_div(sc: Scope, m: Spine): Val | null {
+  const k = m.t.$ === "Ref" ? m.t.k : "";
+  const b = m.args.length === 2 ? term_strip(m.args[1]) : null;
+  const lo = b?.$ === "Var" ? sc.uses.get(probe_of(b))?.val.nv?.[0] : undefined;
+  if (FL.js || (k !== "Nat.div" && k !== "Nat.mod")
+    || !(m.tld as Bend.Def)?.b || lo === undefined || lo < 1) {
+    return null;
+  }
+  const args = emit_each(sc, m.args, [W64, W64]);
+  const [p, q] = args.map((v, i) => val_own(val_to(sc, v, W64))[0])
+    .map((w, i) => op_bare(m.args[i]) ? w : emit_alias(sc, w, "a"));
+  const got = nv_op(k, args.map((v) => v.nv));
+  return { ...val_new([`(${p} ${k === "Nat.div" ? "/" : "%"} ${q})`], W64),
+    ...got && { nv: got } };
+}
+
+// What a call of k on vals answers.
+function nv_res(out: Val, k: Name, vals: Val[]): void {
+  const got = out.ws.length === 1 && !FL.js
+    ? nv_call(k, vals.map((v) => v.nv)) : undefined;
+  if (got) {
+    out.nv = got;
+  }
+}
+
+// A native's parameters take every value its def's calls pass; a sum
+// tested where the loop answers it (nv_sinks) is tested there and every
+// 2^n turns (nv_turns), and no add on the way.
+function nv_params(k: Name, vals: Val[], lane = false): void {
+  const P = FL.nv?.P.get(k);
+  const sink = lane ? undefined : FL.nv?.sink.get(k);
+  const doms = tele_unbind(tld_of(k).T).doms;
+  const at = P?.flatMap((_, j) => j < doms.length && !dom_live(doms[j]) ? []
+    : [j]) ?? [];
+  vals.forEach((v, i) => {
+    const got = P?.[at[i]];
+    if (got && v.ws.length === 1 && at.length === vals.length) {
+      v.nv = got;
+    }
+    if (sink?.has(at[i]) && v.ws.length === 1 && at.length === vals.length) {
+      delete v.nv;
+      v.sink = true;
+    }
+  });
+}
+
+function nv_turns(k: Name, seg: Seg, vals: Val[]): void {
+  const sink = FL.nv?.sink.get(k);
+  const P = FL.nv?.P.get(k);
+  const doms = tele_unbind(tld_of(k).T).doms;
+  const at = P?.flatMap((_, j) => j < doms.length && !dom_live(doms[j]) ? []
+    : [j]) ?? [];
+  if (!seg.spin || !sink || sink.size === 0 || seg.lane) {
+    return;
+  }
+  seg.lines.unshift(...vals.flatMap((v, i) => v.sink && sink.has(at[i])
+    ? [`if ((++wpoll & ${sink.get(at[i])}) == 0) {`,
+      `  ${v.ws[0]} = nat_chk(e, ${v.ws[0]});`, "}"] : []));
+}
+
+// out holds the value v does: so its bounds
+function nv_keep(out: Val, v: Val): Val {
+  if (out.ws.length === 1 && v.ws.length === 1) {
+    v.nv && (out.nv = v.nv);
+    v.sink && (out.sink = true);
+  }
+  return out;
 }
 
 function val_own(v: Val, at: string | null = null, held = false): string[] {
@@ -2285,9 +2357,9 @@ function lay_lazy(v: Val, lay: Lay): boolean {
 }
 
 function val_to(sc: Scope, v: Val, lay: Lay): Val {
-  return lay_eq(v.lay, lay) ? v : lay === BOX ? val_new([val_box(sc, v)], BOX)
-    : v.lay === BOX ? val_unbox(sc, v, lay)
-    : val_arms(sc, lay, v.ws[0], (k) => val_arm(v, k));
+  return lay_eq(v.lay, lay) ? v : nv_keep(lay === BOX
+    ? val_new([val_box(sc, v)], BOX) : v.lay === BOX ? val_unbox(sc, v, lay)
+    : val_arms(sc, lay, v.ws[0], (k) => val_arm(v, k)), v);
 }
 
 function val_arms(sc: Scope, lay: Lay, sel: string, read: (k: Name) => Val[],
@@ -2438,7 +2510,7 @@ function bind_pop(sc: Scope, x: HTerm, at: Lay | null): Val {
   bind_set(sc, p, b, b.n - 1);
   const lay = lay_at(b.A, b.val);
   if (at !== BOX && lay_lazy(b.val, lay)) {
-    return val_unbox(sc, { ...b.val, rs: [p.k] }, lay);
+    return nv_keep(val_unbox(sc, { ...b.val, rs: [p.k] }, lay), b.val);
   }
   bind_keep(sc, b, "term_keep(e, $, 1)");
   return b.val;
@@ -2960,6 +3032,7 @@ function emit_inl(sc: Scope, m: Spine): Val {
   const out = val_new(emit_hold(sc, ret.ks.map(() => "0"), "o", ret.ks), ret);
   const il = { ...sc, def: k, uses: new Map(), spares: [], rest: [],
     inl: true };
+  nv_res(out, k, vals);
   block(sc, "{", () => emit_body(il, h!, tld_of(k).T, vals, out));
   bind_dead(sc, sc.rest,
     m.xs.map(term_strip).filter((x) => x.$ === "Var").map(probe_of));
@@ -2989,7 +3062,8 @@ function emit_put(sc: Scope, dst: Val | null, v: Val): void {
   if (!lent && !FL.probe && !sc.inl) {
     FL.rets.has(u) && fact_add("rown", u);
   }
-  const ws = lent ? w.ws : val_own(w);
+  const ws = (lent ? w.ws : val_own(w)).map((x) => w.sink
+    ? `nat_chk(e, ${x})` : x);
   if (dst && FL.ix) {
     ws.forEach((x, j) => ix_out(sc, dst.ws[j], x));
   }
@@ -3013,6 +3087,7 @@ function emit_spin(sc: Scope, ck: Spine): Val {
   const out = val_new(ivs ? emit_hold(sc, ret.ks.map(() => "0"), "o", ret.ks)
     : ret.ks.map((kd, j) => `${kd === "w32" ? "(u32)" : ""}${o}[${j}]`), ret,
   ivs ? [] : ret_root(k, vs));
+  nv_res(out, k, vs);
   if (ivs) {
     // in place: the callee's body over its arguments, rooted as its own,
     // and its result no result of the unit
@@ -3290,9 +3365,11 @@ function emit_native(sc: Scope, k: Name, to?: Name,
       // a pass names its words as the last did: what those lent is not its
       FL.unit!.arrs.clear();
       const [sl, vals] = emit_open(k, lend);
+      nv_params(k, vals, !!to);
       const seg = Object.assign(sl.seg, { fid: name, native: true, lane: to });
       emit_body(sl, fun_of(k).h!, tld_of(k).T, vals,
         val_new(seg.ret.ks.map((_, j) => `o[${j}]`), seg.ret));
+      nv_turns(k, seg, vals);
       return seg;
     };
     const ix: Ix = FL.ix = { forms: new Map(), roles: null, info: new Map(),
@@ -3682,11 +3759,696 @@ function ix_site(sc: Scope, k: Name, m: Spine): boolean {
   return true;
 }
 
+// Nv
+// ==
+
+// A Nat's bounds over a whole run (lo, hi), from literals, matches, calls
+// and the ops. nv_book reads them off every def before C is emitted: a
+// parameter is what all its def's calls pass (anything, if the def is named
+// anywhere but as the head of a full call), a result what all its arms
+// answer. Every Nat is at most NAT_MAX, so an add, a mul or a successor
+// whose bounds stay under it cannot pass the limit and is emitted with no
+// test; the emitter carries a word's bounds on its Val (nv).
+// A loop's self-calls that each step one parameter down (a predecessor, or
+// a positive one divided by 2 or more) bound its turns by that parameter's
+// bound on entry; a parameter every self-call passes as it is or grown by a
+// bounded amount is then under its entry bound plus the turns times that
+// amount. A Bool parameter that every call passes as a comparison of two of
+// the others (or of one and a constant) bounds them in the arms of a match
+// on it.
+
+type Nv = [number, number];
+
+// a parameter p of the def walked, stepped: down by c, divided by c, or
+// grown by up to c ("same": passed as it is)
+type NvStep = { p: number; c: number; how: "down" | "div" | "grow" };
+
+type NvArg = { v: Nv | null; x: HTerm | null; d?: NvStep };
+
+type NvSide = { p: number } | { c: number };
+
+type NvRel = { op: string; a: NvSide; b: NvSide };
+
+type NvCx = { k: Name; ps: Map<number, number>; pv: number[];
+  steps: Map<number, NvStep>; selfs: (NvStep | "same" | null)[][];
+  vs: (Nv | null)[][]; clo: boolean; env: Map<number, Nv>; split?: boolean };
+
+type NvBook = { P: Map<Name, (Nv | null)[]>; E: Map<Name, (Nv | null)[]>;
+  R: Map<Name, Nv | null>; top: Set<Name>; rel: Map<Name, (NvRel | null)[]>;
+  sites: Map<Name, Map<HTerm, NvRel[][]>>; rels: boolean; moved: boolean;
+  sink: Map<Name, Map<number, number>>;
+  walks: Map<Name, number>; calls: Map<Name, Set<Name>>; queue: Name[];
+  queued: Set<Name>; erased: Map<HTerm, [HTerm, HTerm]> };
+
+const NAT_MAX = 2 ** 48 - 1;
+
+const NV_TOP: Nv = [0, NAT_MAX];
+
+const NV_ROUNDS = 64;
+
+const NV_LOW = 4;
+
+const NV_BARE: Record<Name, string> = { "Nat.add": "($0 + $1)",
+  "Nat.double": "($0 + $0)", "Nat.mul": "($0 * $1)" };
+
+const NV_CMPS: Record<string, string> = { "Nat.is_lt": "lt", "Nat.is_le": "le",
+  "Nat.is_gt": "gt", "Nat.is_ge": "ge", "Nat.is_eq": "eq" };
+
+function nv_cap(lo: number, hi: number): Nv {
+  return [Math.min(lo, NAT_MAX), Math.min(hi, NAT_MAX)];
+}
+
+function nv_join(a: Nv | null, b: Nv | null): Nv | null {
+  return a === null ? b : b === null ? a
+    : [Math.min(a[0], b[0]), Math.max(a[1], b[1])];
+}
+
+// old joined with got, after n walks: a bound that keeps moving goes to
+// its end, a low one soon (it moves a step a walk down a countdown), a high
+// one after NV_ROUNDS (a Newton step takes a walk per bit to settle).
+function nv_widen(old: Nv | null, got: Nv | null, n: number): Nv | null {
+  const v = nv_join(old, got);
+  return old === null || v === null ? v : [v[0] < old[0] && n > NV_LOW ? 0
+    : v[0], v[1] > old[1] && n > NV_ROUNDS ? NAT_MAX : v[1]];
+}
+
+function nv_same(a: Nv | null, b: Nv | null): boolean {
+  return a === b || (a !== null && b !== null && a[0] === b[0]
+    && a[1] === b[1]);
+}
+
+// An op of Base's on bounds as, or undefined: the add, mul and successor
+// keep NAT_MAX (past it is a failure), a division by zero answers 0 and a
+// remainder by zero its dividend.
+function nv_op(k: Name, as: (Nv | null | undefined)[]): Nv | undefined {
+  const [a, b] = [as[0] ?? NV_TOP, as[1] ?? NV_TOP];
+  switch (k) {
+    case "Nat.add":
+      return nv_cap(a[0] + b[0], a[1] + b[1]);
+    case "Nat.double":
+      return nv_cap(2 * a[0], 2 * a[1]);
+    case "Nat.mul":
+      return nv_cap(a[0] * b[0], a[1] * b[1]);
+    case "Nat.sub":
+      return [Math.max(a[0] - b[1], 0), Math.max(a[1] - b[0], 0)];
+    case "Nat.min":
+      return [Math.min(a[0], b[0]), Math.min(a[1], b[1])];
+    case "Nat.max":
+      return [Math.max(a[0], b[0]), Math.max(a[1], b[1])];
+    case "Nat.div":
+      return b[1] === 0 ? [0, 0] : [b[0] === 0 ? 0 : Math.floor(a[0] / b[1]),
+        Math.floor(a[1] / Math.max(b[0], 1))];
+    case "Nat.mod":
+      return b[1] === 0 || a[1] < b[0] ? a : [0, b[0] === 0 ? a[1]
+        : Math.min(a[1], b[1] - 1)];
+    case "U32.to_nat":
+      return [a[0], Math.min(a[1], 0xFFFFFFFF)];
+    default:
+      return undefined;
+  }
+}
+
+// Whether op k on bounds as stays under the limit: its test can go.
+function nv_safe(k: Name, as: (Nv | null | undefined)[]): boolean {
+  const [a, b] = [as[0] ?? NV_TOP, as[1] ?? NV_TOP];
+  return k === "Nat.add" ? a[1] + b[1] <= NAT_MAX
+    : k === "Nat.double" ? 2 * a[1] <= NAT_MAX
+    : k === "Nat.mul" && a[1] * b[1] <= NAT_MAX;
+}
+
+// What a call of def k answers: an op of Base's by its bounds, else k's.
+function nv_call(k: Name, as: (Nv | null | undefined)[]): Nv | undefined {
+  const tld = tld_of(k);
+  const op = tld?.$ === "Def" && tld.b ? nv_op(k, as) : undefined;
+  return op ?? FL.nv?.R.get(k) ?? undefined;
+}
+
+function nv_book(): void {
+  const st: NvBook = FL.nv = { P: new Map(), E: new Map(), R: new Map(),
+    top: new Set(), rel: new Map(), sites: new Map(), rels: false,
+    sink: new Map(),
+    moved: false, walks: new Map(), calls: new Map(),
+    queue: [], queued: new Set(), erased: new Map() };
+  const defs = done_defs().map(([k]) => k).filter((k) => fun_of(k).h !== null
+    && !def_foreign(tld_of(k)));
+  for (const k of defs) {
+    st.E.set(k, Array(fun_of(k).n).fill(null));
+    st.P.set(k, Array(fun_of(k).n).fill(null));
+    st.R.set(k, null);
+  }
+  ["main", ...FL.fids].forEach((k) => nv_escape(k));
+  // the relations first, read off calls alone, until no walk changes one
+  st.rels = true;
+  for (let n = 0; ; n++) {
+    st.moved = false;
+    defs.forEach((k) => nv_def(k));
+    if (!st.moved) {
+      break;
+    }
+    if (n === 8) {
+      st.rel.clear();
+      break;
+    }
+  }
+  st.rels = false;
+  st.queue = [];
+  st.queued.clear();
+  st.walks.clear();
+  defs.forEach((k) => nv_push(k));
+  while (st.queue.length > 0) {
+    const k = st.queue.shift()!;
+    st.queued.delete(k);
+    nv_def(k);
+  }
+}
+
+function nv_push(k: Name): void {
+  const st = FL.nv!;
+  if (st.P.has(k) && !st.queued.has(k)) {
+    st.queued.add(k);
+    st.queue.push(k);
+  }
+}
+
+// k is named where its parameters may take anything
+function nv_escape(k: Name): void {
+  const st = FL.nv!;
+  if (st.P.has(k) && !st.top.has(k)) {
+    st.top.add(k);
+    st.rel.set(k, Array(fun_of(k).n).fill(null));
+    st.E.set(k, Array(fun_of(k).n).fill(NV_TOP));
+    nv_push(k);
+  }
+}
+
+// The comparisons a Bool parameter of k is on every call: each call
+// site's own (its walk's latest), and k's those they all state.
+function nv_rel_site(k: Name, at: HTerm, as: NvArg[], cx: NvCx): void {
+  const st = FL.nv!;
+  const doms = tele_unbind(tld_of(k).T).doms;
+  const xs = as.map((a) => a.x);
+  const site = as.map((a, j) => a.x === null || ty_adt(doms[j]?.[2] ?? null)?.k
+    !== "Bool" ? [] : nv_rel_of(a.x, xs, doms, cx));
+  memo(st.sites, k, () => new Map()).set(at, site);
+  const old = st.rel.get(k);
+  const all = [...st.sites.get(k)!.values()];
+  const rel = st.top.has(k) ? site.map(() => null) : site.map((_, j) =>
+    all[0][j].find((r) => all.every((rs) => rs[j].some((q) =>
+      nv_rel_eq(q, r)))) ?? null);
+  if (!old || rel.some((r, j) => (r === null) !== (old[j] === null)
+    || (r !== null && !nv_rel_eq(r, old[j]!)))) {
+    st.rel.set(k, rel);
+    st.moved = true;
+  }
+}
+
+function nv_rel_eq(a: NvRel, b: NvRel): boolean {
+  const side = (x: NvSide, y: NvSide) => "p" in x ? "p" in y && x.p === y.p
+    : "c" in y && x.c === y.c;
+  return a.op === b.op && side(a.a, b.a) && side(a.b, b.b);
+}
+
+// The relations x states between the other arguments xs of its call: a
+// comparison, or a parameter of the def walked that its relation holds of.
+function nv_rel_of(x: HTerm, xs: (HTerm | null)[], doms: Dom[],
+  cx: NvCx): NvRel[] {
+  const v = term_strip(x);
+  const q = v.$ === "Var" ? cx.ps.get(v.i) : undefined;
+  const r = q === undefined ? null : FL.nv!.rel.get(cx.k)?.[q] ?? null;
+  if (r !== null) {
+    // the parameters it relates, as the call passes them on
+    const to = (s: NvSide): NvSide[] => "c" in s ? [s] : xs.flatMap((y, i) => {
+      const w = y && term_strip(y);
+      return w?.$ === "Var" && cx.ps.get(w.i) === s.p
+        && ty_adt(doms[i]?.[2] ?? null)?.k === "Nat" ? [{ p: i }] : [];
+    });
+    return to(r.a).flatMap((a) => to(r.b).map((b) => ({ op: r.op, a, b })));
+  }
+  const m = term_spine(v);
+  const op = m.t.$ === "Ref" && (tld_of(m.t.k) as Bend.Def)?.b
+    && NV_CMPS[m.t.k];
+  if (!op || m.args.length !== 2) {
+    return [];
+  }
+  const sides = (a: HTerm): NvSide[] => {
+    const c = nv_const(a);
+    return c !== null ? [{ c }] : xs.flatMap((y, i) => y !== null && y !== x
+      && ty_adt(doms[i]?.[2] ?? null)?.k === "Nat" && term_same(a, y)
+      ? [{ p: i }] : []);
+  };
+  return sides(m.args[0]).flatMap((a) => sides(m.args[1]).map((b) =>
+    ({ op, a, b })));
+}
+
+function nv_const(t: HTerm): number | null {
+  const s = Bend.term_strip(t);
+  if (!term_const(s) && s.$ !== "Lit") {
+    const m = term_spine(s);
+    return m.t.$ === "Ref" && m.t.k === "U32.to_nat" && m.args.length === 1
+      ? nv_const(m.args[0]) : null;
+  }
+  if (s.$ === "Lit") {
+    return s.k === "Nat" || s.k === "U32" ? s.v : null;
+  }
+  if (s.$ === "Ctr" && (s.k === "Succ" || s.k === "Zero")) {
+    const [b, n] = nat_peel(s);
+    return b === null ? n : null;
+  }
+  return Bend.u32_from_term(s);
+}
+
+function nv_def(k: Name): void {
+  const st = FL.nv!;
+  const f = fun_of(k);
+  const E = st.rels ? Array(f.n).fill(NV_TOP) : st.E.get(k)!;
+  if (f.n > 0 && E.some((v) => v === null)) {
+    return;
+  }
+  const P = st.P.get(k)!;
+  const walks = (st.walks.get(k) ?? 0) + 1;
+  st.walks.set(k, walks);
+  const cx: NvCx = { k, ps: new Map(), pv: [], steps: new Map(), selfs: [],
+    vs: [], clo: false, env: new Map() };
+  // the body's lambdas take the live parameters, as emit_body's do
+  const doms = tele_unbind(tld_of(k).T).doms;
+  const pend = P.flatMap((v, j) => j < doms.length && !dom_live(doms[j]) ? []
+    : [{ v: nv_join(v, E[j]), x: null, p: j }]);
+  const r = nv_ev(f.h!, tld_of(k).T, pend, cx);
+  if (st.rels) {
+    return;
+  }
+  const R2 = nv_widen(st.R.get(k)!, r, walks);
+  if (!nv_same(R2, st.R.get(k)!)) {
+    st.R.set(k, R2);
+    st.calls.get(k)?.forEach(nv_push);
+  }
+  // the turns of the loop the self-calls make, if a parameter steps down
+  let T = cx.selfs.length === 0 ? 0 : Infinity;
+  for (let j = 0; j < f.n; j++) {
+    const ss = cx.selfs.map((s) => s[j]);
+    const hi = E[j]![1];
+    if (cx.selfs.length > 0 && ss.every((s) => s !== null && s !== "same"
+      && s.p === j && s.how !== "grow")) {
+      T = Math.min(T, ss.every((s) => (s as NvStep).how === "div")
+        ? (hi >= 1 ? Math.floor(Math.log2(hi)) + 1 : 0) : hi);
+    }
+  }
+  const P2 = P.map((old, j) => {
+    const ss = cx.selfs.map((s) => s[j]);
+    const grow = ss.every((s) => s === "same" || (s !== null
+      && s.how === "grow" && s.p === j));
+    const B = grow ? Math.max(0, ...ss.map((s) => s === "same" ? 0 : s!.c))
+      : 0;
+    const got = T < Infinity && grow
+      ? nv_cap(E[j]![0], E[j]![1] + T * B)
+      : cx.vs.reduce((a, vs) => nv_join(a, vs[j]), E[j]);
+    return nv_widen(old, got, walks);
+  });
+  st.sink.set(k, nv_sinks(k, cx, P2));
+  if (P2.some((v, j) => !nv_same(v, P[j]))) {
+    st.P.set(k, P2);
+    nv_push(k);
+  }
+}
+
+// Every def named in t takes anything: a part the walk does not read.
+function nv_scan(t: HTerm): Nv {
+  term_any(t, (s) => (s.$ === "Ref" && nv_escape(s.k), false));
+  return NV_TOP;
+}
+
+// The bounds of t applied to pend, null where no run gets: a call records
+// its arguments for its def (or the walked def's self-call, with how each
+// steps a parameter).
+function nv_ev(t: HTerm, ty0: HTerm | null, pend: (NvArg & { p?: number })[],
+  cx: NvCx): Nv | null {
+  const st = FL.nv!;
+  const env = cx.env;
+  const raw = Bend.term_strip(t);
+  if (raw.$ === "Lit" && pend.length === 0) {
+    return raw.k === "Nat" || raw.k === "U32" ? nv_cap(raw.v, raw.v) : NV_TOP;
+  }
+  const [x, ty] = ty_peel(t, ty0);
+  switch (x.$) {
+    case "Var": {
+      return pend.length > 0 ? NV_TOP : env.get(x.i) ?? NV_TOP;
+    }
+    case "Ctr": {
+      if (pend.length > 0) {
+        return nv_scan(x);
+      }
+      if (x.k === "Succ" || x.k === "Zero") {
+        const [b, n] = nat_peel(x);
+        const v = b === null ? [0, 0] as Nv : nv_ev(b, null, [], cx);
+        return v && nv_cap(v[0] + n, v[1] + n);
+      }
+      x.x.forEach((y) => nv_ev(y, null, [], cx));
+      return NV_TOP;
+    }
+    case "Lam": {
+      const all = ty === null ? null : Bend.tele_open(FL.book, ty);
+      if (all === null) {
+        return nv_scan(x);
+      }
+      if (all.q.$ === "None") {
+        const [b, B] = memo(st.erased, x, () => {
+          const v: HTerm = Bend.Var(x.k, x.i);
+          return [x.f(v), all.B(v)];
+        });
+        return nv_ev(b, B, pend, cx);
+      }
+      const o = term_open(x);
+      const p = o.ps[0].i;
+      if (pend.length === 0) {
+        // a closure: called from anywhere, with anything
+        const clo = cx.clo;
+        cx.clo = true;
+        env.set(p, NV_TOP);
+        nv_ev(o.b, all.B(DUMMY), [], cx);
+        cx.clo = clo;
+        return NV_TOP;
+      }
+      const a = pend[0];
+      env.set(p, a.v ?? NV_TOP);
+      if (a.p !== undefined && !cx.clo) {
+        cx.ps.set(p, a.p);
+        cx.pv[a.p] = p;
+      }
+      if (a.d) {
+        cx.steps.set(p, a.d);
+      }
+      return nv_ev(o.b, all.B(DUMMY), pend.slice(1), cx);
+    }
+    case "Let": {
+      const o = term_open(x);
+      x.v.forEach((v, j) => {
+        const p = o.ps[j].i;
+        env.set(p, nv_ev(v, null, [], cx) ?? NV_TOP);
+        const d = nv_step(v, cx);
+        if (d && d !== "same") {
+          cx.steps.set(p, d);
+        } else if (d === "same") {
+          const q = cx.ps.get((term_strip(v) as Of<"Var">).i);
+          q !== undefined && cx.ps.set(p, q);
+        }
+      });
+      return nv_ev(o.b, ty, pend, cx);
+    }
+    case "Mat": {
+      const all = ty === null ? null : Bend.tele_open(FL.book, ty);
+      const adt = all && ty_adt(all.A);
+      if (pend.length === 0 || adt === null) {
+        return nv_scan(x);
+      }
+      const [s, rest] = [pend[0], pend.slice(1)];
+      const sv = s.v ?? NV_TOP;
+      const sx = s.x && term_strip(s.x);
+      const at = sx?.$ === "Var" ? sx.i : -1;
+      // the parameter it is, if one: matched as it comes, or by its probe
+      const q = cx.clo ? undefined : s.p ?? (at >= 0 ? cx.ps.get(at)
+        : undefined);
+      // what an arm knows: the scrutinee's bounds, and a Bool's relation's
+      const arm = (h: HTerm, args: NvArg[], fix: [number, Nv][]): Nv | null => {
+        if (fix.some(([, v]) => v[0] > v[1])) {
+          return null;
+        }
+        const old = fix.map(([p]) => [p, env.get(p)] as const);
+        fix.forEach(([p, v]) => env.set(p, v));
+        const r = nv_ev(h, null, [...args, ...rest], cx);
+        old.forEach(([p, v]) => v === undefined ? env.delete(p)
+          : env.set(p, v));
+        return r;
+      };
+      const { arms, end } = mat_arms(x);
+      let out: Nv | null = null;
+      for (const [c, h] of arms) {
+        if (adt.k === "Nat" && c === "Zero") {
+          out = nv_join(out, arm(h, [], at < 0 ? [[-1, [0, sv[0] > 0 ? -1 : 0]]]
+            : [[at, [0, sv[0] > 0 ? -1 : 0]]]));
+        } else if (adt.k === "Nat" && c === "Succ") {
+          const lo = Math.max(sv[0], 1);
+          const ds = at >= 0 ? cx.steps.get(at) : undefined;
+          const d: NvStep | undefined = q !== undefined
+            ? { p: q, c: 1, how: "down" } : ds?.how === "down"
+            ? { p: ds.p, c: ds.c + 1, how: "down" } : undefined;
+          out = nv_join(out, arm(h, [{ v: [lo - 1, sv[1] - 1], x: null, d }],
+            at < 0 ? [[-1, [lo, sv[1]]]] : [[at, [lo, sv[1]]]]));
+        } else if (adt.k === "Bool") {
+          out = nv_join(out, arm(h, [], nv_rel_fix(cx, q, c === "True")));
+        } else {
+          const ctr = FL.book.ctrs[c];
+          const n = ctr ? ctr_tail(ctr).filter(dom_live).length : 0;
+          out = nv_join(out, arm(h, Array(n).fill({ v: NV_TOP, x: null }),
+            []));
+        }
+      }
+      if (term_strip(end).$ !== "Efq") {
+        out = nv_join(out, nv_ev(end, null, pend, cx));
+      }
+      return out;
+    }
+    case "Efq": {
+      return null;
+    }
+    case "Ref":
+    case "App": {
+      const m = term_spine(x);
+      const as: NvArg[] = [...m.all.map((a, i) => ({ x: a, v: m.live[i]
+        ? nv_ev(a, null, [], cx) : NV_TOP })), ...pend];
+      if (m.t.$ !== "Ref") {
+        return nv_ev(m.t, null, as.filter((_, i) => i >= m.all.length
+          || m.live[i]), cx);
+      }
+      if (as.some((a) => a.v === null)) {
+        return null;
+      }
+      const k = m.t.k;
+      if (intr_of(k)) {
+        return nv_split(x, m, cx) ?? nv_op(k, as.map((a) => a.v)) ?? NV_TOP;
+      }
+      if (!st.P.has(k)) {
+        return NV_TOP;
+      }
+      if (as.length !== fun_of(k).n) {
+        nv_escape(k);
+        return NV_TOP;
+      }
+      if (st.rels) {
+        nv_rel_site(k, x, as, cx);
+        return NV_TOP;
+      }
+      memo(st.calls, k, () => new Set()).add(cx.k);
+      if (k === cx.k && !cx.clo) {
+        cx.selfs.push(as.map((a) => a.x && nv_step(a.x, cx)));
+        cx.vs.push(as.map((a) => a.v));
+      } else {
+        const E = st.E.get(k)!;
+        const E2 = E.map((v, j) => nv_widen(v, as[j].v,
+          st.walks.get(k) ?? 0));
+        if (E2.some((v, j) => !nv_same(v, E[j]))) {
+          st.E.set(k, E2);
+          nv_push(k);
+        }
+      }
+      const R = (tld_of(k) as Bend.Def).b ? nv_op(k, as.map((a) => a.v))
+        : undefined;
+      return R ?? st.R.get(k)!;
+    }
+    default: {
+      return nv_scan(x);
+    }
+  }
+}
+
+// An add whose two operands read one variable (y + n / y) is bounded apart
+// at that variable's least value and above it.
+function nv_split(x: HTerm, m: Spine, cx: NvCx): Nv | null | undefined {
+  if (cx.split || m.t.$ !== "Ref" || m.t.k !== "Nat.add" || m.args.length !== 2
+    || FL.nv!.rels) {
+    return undefined;
+  }
+  const vs = (t: HTerm) => {
+    const out = new Set<number>();
+    term_any(t, (w) => (w.$ === "Var" && cx.env.has(w.i) && out.add(w.i),
+      false));
+    return out;
+  };
+  const b = vs(m.args[1]);
+  const v = [...vs(m.args[0])].find((i) => b.has(i)
+    && cx.env.get(i)![0] < cx.env.get(i)![1]);
+  if (v === undefined) {
+    return undefined;
+  }
+  const old = cx.env.get(v)!;
+  cx.split = true;
+  cx.env.set(v, [old[0], old[0]]);
+  const lo = nv_ev(x, null, [], cx);
+  cx.env.set(v, [old[0] + 1, old[1]]);
+  const hi = nv_ev(x, null, [], cx);
+  cx.env.set(v, old);
+  cx.split = false;
+  return nv_join(lo, hi);
+}
+
+// A loop's sum that grows on two self-calls or more, by bounded amounts,
+// and is read nowhere else but where the loop answers it, is tested at that
+// answer, and every 2^n turns so its word cannot wrap (n: the most turns
+// that cannot, at most 15): a test in each arm keeps clang from merging
+// them. Only if nothing the loop calls may run forever (no @unsafe def):
+// the program still stops with the same message, a bounded number of turns
+// later. Answers, for each such parameter, the mask of its turn count.
+function nv_sinks(k: Name, cx: NvCx, P: (Nv | null)[]): Map<number, number> {
+  const out = new Map<number, number>();
+  const n = fun_of(k).n;
+  for (let j = 0; j < n && cx.selfs.length >= 2 && !cx.clo; j++) {
+    const ss = cx.selfs.map((s) => s[j]);
+    const gs = ss.filter((s) => s !== "same" && s?.how === "grow"
+      && s.p === j) as NvStep[];
+    const B = Math.max(1, ...gs.map((s) => s.c));
+    const bits = Math.min(15, Math.floor(Math.log2((2 ** 64 - 2 ** 48) / B)));
+    if (gs.length < 2 || gs.length + ss.filter((s) => s === "same").length
+      < ss.length || P[j] === null || P[j]![1] + B <= NAT_MAX || bits < 1
+      || !nv_reads(k, cx, j) || !nv_quiet(k, new Set())) {
+      continue;
+    }
+    out.set(j, 2 ** bits - 1);
+  }
+  return out;
+}
+
+// Whether k and all it calls are checked to end (none is @unsafe), the
+// loop k makes aside.
+function nv_quiet(k: Name, seen: Set<Name>): boolean {
+  if (seen.has(k)) {
+    return true;
+  }
+  seen.add(k);
+  return !term_any(fun_of(k).h ?? DUMMY, (y) => y.$ === "Ref" && y.k !== k
+    && !intr_of(y.k) && (!done_live(tld_of(y.k)) || !!(tld_of(y.k) as
+      Bend.Def).u || !nv_quiet(y.k, seen)));
+}
+
+// Whether parameter j of k is read only as an operand of the adds that pass
+// it to the next turn, or where k answers.
+function nv_reads(k: Name, cx: NvCx, j: number): boolean {
+  const mine = (i: number) => cx.ps.get(i) === j
+    || (cx.steps.get(i)?.how === "grow" && cx.steps.get(i)!.p === j);
+  // the reads of j along a chain of adds
+  const chain = (t: HTerm): number => {
+    const s = term_strip(t);
+    if (s.$ === "Var") {
+      return mine(s.i) ? 1 : 0;
+    }
+    const m = term_spine(s);
+    return m.t.$ === "Ref" && m.t.k === "Nat.add" && m.args.length === 2
+      ? chain(m.args[0]) + chain(m.args[1]) : 0;
+  };
+  let all = 0;
+  let ok = 0;
+  term_any(fun_of(k).h!, (s, tail) => {
+    if (s.$ === "Var" && mine(s.i)) {
+      all++;
+      ok += Number(tail);
+    } else if (s.$ === "Let") {
+      const o = term_open(s);
+      o.ps.forEach((p, i) => cx.steps.get(p.i)?.how === "grow"
+        && cx.steps.get(p.i)!.p === j && (ok += chain(s.v[i])));
+    } else if (s.$ === "App" || s.$ === "Var") {
+      const m = term_spine(s);
+      if (m.t.$ === "Ref" && m.t.k === k && m.all.length === fun_of(k).n) {
+        ok += chain(m.all[j]);
+      } else if (tail) {
+        ok += chain(s);
+      }
+    }
+    return false;
+  });
+  return all > 0 && all === ok;
+}
+
+// How argument x steps a parameter of the def walked.
+function nv_step(x: HTerm, cx: NvCx, deep = 0): NvStep | "same" | null {
+  if (cx.clo || deep > 8) {
+    return null;
+  }
+  const s = term_strip(x);
+  if (s.$ === "Var") {
+    const p = cx.ps.get(s.i);
+    return p !== undefined ? "same" : cx.steps.get(s.i) ?? null;
+  }
+  // a successor of a parameter grows it
+  const [b, n] = s.$ === "Ctr" && s.k === "Succ" ? nat_peel(s) : [null, 0];
+  if (b !== null) {
+    const g = nv_step(b, cx, deep + 1);
+    return g === "same" ? { p: (cx.ps.get((term_strip(b) as Of<"Var">).i))!,
+      c: n, how: "grow" } : g?.how === "grow" ? { ...g, c: g.c + n } : null;
+  }
+  const m = term_spine(s);
+  const k = m.t.$ === "Ref" && (tld_of(m.t.k) as Bend.Def)?.b ? m.t.k : "";
+  if (m.args.length !== 2 || (k !== "Nat.add" && k !== "Nat.div")) {
+    return null;
+  }
+  const [a, c] = m.args;
+  if (k === "Nat.div") {
+    const p = term_strip(a);
+    const q = p.$ === "Var" ? cx.ps.get(p.i) : undefined;
+    const by = nv_const(c);
+    return q !== undefined && by !== null && by >= 2
+      && (cx.env.get(p.i as number) ?? NV_TOP)[0] >= 1
+      ? { p: q, c: by, how: "div" } : null;
+  }
+  for (const [y, z] of [[a, c], [c, a]]) {
+    const g = nv_step(y, cx, deep + 1);
+    const v = g === null ? null : nv_ev(z, null, [], cx);
+    const p = g === "same" ? cx.ps.get((term_strip(y) as Of<"Var">).i)!
+      : g?.how === "grow" ? g.p : undefined;
+    // the amount grown reads nothing p steps to
+    if (p !== undefined && v !== null && !term_any(z, (w) => w.$ === "Var"
+      && (cx.ps.get(w.i) === p || cx.steps.get(w.i)?.p === p))) {
+      return { p, c: (g === "same" ? 0 : (g as NvStep).c) + v[1],
+        how: "grow" };
+    }
+  }
+  return null;
+}
+
+// The bounds the arm of a match on Bool probe at fixes, from its relation.
+function nv_rel_fix(cx: NvCx, j: number | undefined,
+  yes: boolean): [number, Nv][] {
+  const r = j === undefined ? null : FL.nv!.rel.get(cx.k)?.[j] ?? null;
+  if (r === null) {
+    return [];
+  }
+  const get = (s: NvSide): [number, Nv] => "c" in s ? [-1, [s.c, s.c]]
+    : [cx.pv[s.p] ?? -1, cx.env.get(cx.pv[s.p] ?? -1) ?? NV_TOP];
+  let [[pa, a], [pb, b]] = [get(r.a), get(r.b)];
+  // a < b, a <= b, a == b, or (no) b <= a, b < a, a != b
+  let op = r.op === "gt" ? "lt" : r.op === "ge" ? "le" : r.op;
+  if (r.op === "gt" || r.op === "ge") {
+    [[pa, a], [pb, b]] = [[pb, b], [pa, a]];
+  }
+  if (!yes) {
+    if (op === "eq") {
+      return [];
+    }
+    [[pa, a], [pb, b]] = [[pb, b], [pa, a]];
+    op = op === "lt" ? "le" : "lt";
+  }
+  const d = op === "lt" ? 1 : 0;
+  const na: Nv = op === "eq" ? [Math.max(a[0], b[0]), Math.min(a[1], b[1])]
+    : [a[0], Math.min(a[1], b[1] - d)];
+  const nb: Nv = op === "eq" ? na : [Math.max(b[0], a[0] + d), b[1]];
+  return [[pa, na], [pb, nb]].filter(([p]) => p >= 0) as [number, Nv][];
+}
+
 function emit_intr(sc: Scope, k: Name, m: Spine, ty: HTerm | null): Val {
   const steal = k === "Array.set" && place_take(sc, m.args.map(term_strip));
   const bare = ix_site(sc, k, m);
   const args = emit_each(sc, m.args);
-  const C = intr_of(k)!.C!;
+  const nvs = args.map((v) => v.nv);
+  const sink = k === "Nat.add" && args.some((v) => v.sink);
+  const C = !FL.js && (sink || nv_safe(k, nvs)) ? NV_BARE[k]
+    : intr_of(k)!.C!;
   if (/^Array\.(new|clone)$/.test(k)
     && lay_el(m.all[0]).ks.includes("box")
     && !(k === "Array.new" && ctr_packed(m.all[2]))) {
@@ -3698,11 +4460,14 @@ function emit_intr(sc: Scope, k: Name, m: Spine, ty: HTerm | null): Val {
   const lays = fun_of(k).lays;
   const as = args.map((v, i) => val_own(val_to(sc, v, lays[i]))[0])
     .map((w, i) => op_bare(m.args[i]) && !w.startsWith("term_keep") ? w
-      : emit_alias(sc, w, "a"));
+      : emit_alias(sc, w, "a"))
+    .map((w, i) => args[i].sink && !sink ? `nat_chk(e, ${w})` : w);
   const lay = lay_of(ty);
+  const got = sink ? undefined : nv_op(k, nvs);
   return Array.isArray(C)
     ? val_new(C.map((p) => emit_alias(sc, tpl(p, as), "a")), lay)
-    : val_new([tpl(C, as)], lay.ks.length === 1 ? lay : BOX);
+    : { ...val_new([tpl(C, as)], lay.ks.length === 1 ? lay : BOX),
+      ...got && { nv: got }, ...sink && { sink } };
 }
 
 function emit_clo(sc: Scope, x: HTerm, ty: HTerm | null): Val {
@@ -3726,7 +4491,7 @@ function emit_ctr(sc: Scope, x: Of<"Ctr">, ty: HTerm | null,
   at: Lay | null): Val {
   const [adt, u] = ctr_adt(x, ty);
   if (u !== null) {
-    return val_new([`${u}ull`], W32, [], true);
+    return { ...val_new([`${u}ull`], W32, [], true), nv: [u, u] };
   }
   const flds = ctr_flds(x);
   const ctr = FL.book.ctrs[x.k];
@@ -3734,9 +4499,14 @@ function emit_ctr(sc: Scope, x: Of<"Ctr">, ty: HTerm | null,
   if (word || adt.k === "Array") {
     if (adt.k === "Nat") {
       const [b, n] = nat_peel(x, (s) => emit_refold(sc, s));
-      return b === null ? val_new([`${n}ull`], word, [], true)
-        : val_new([`nat_chk(e, ${emit_expr(sc, b, adt, null).ws[0]} + ${n})`],
-          word);
+      if (b === null) {
+        return { ...val_new([`${n}ull`], word, [], true), nv: [n, n] };
+      }
+      const v = emit_expr(sc, b, adt, null);
+      const nv = v.nv && nv_cap(v.nv[0] + n, v.nv[1] + n);
+      return { ...val_new([v.nv && v.nv[1] + n <= NAT_MAX
+        ? `(${v.ws[0]} + ${n})` : `nat_chk(e, ${v.ws[0]} + ${n})`], word),
+      ...nv && { nv } };
     }
     const vs = emit_each(sc, flds, [], ctr_doms(ctr, adt.x));
     return val_new([adt.k === "Array" ? x.k === "ALeaf"
@@ -3950,6 +4720,10 @@ function emit_expr(sc: Scope, tm: HTerm, ty0: HTerm | null,
         return emit_expr(sc, got, ty, at);
       }
       const m = term_spine(x);
+      const dv = nv_div(sc, m);
+      if (dv !== null) {
+        return dv;
+      }
       if (flat_call(x)) {
         return inl_q(sc, m) ? emit_inl(sc, m) : emit_spin(sc, m);
       }
@@ -4371,7 +5145,9 @@ function emit_match(sc: Scope, x: Of<"Mat"> | Of<"Efq">,
   const lv: [string, HTerm, (al: Scope) => Val[]][] = rows !== null
     ? rows.map(([h, j, n, f]) => [lits_cond(sw, j, n), h, () => {
       if (!word) {
-        return [val_new([`(${sw} - ${n})`], lay)].slice(0, f);
+        const lo = Math.max(u.nv?.[0] ?? 0, n);
+        return [{ ...val_new([`(${sw} - ${n})`], lay), nv: [lo - n,
+          Math.max((u.nv?.[1] ?? NAT_MAX) - n, 0)] as Nv }].slice(0, f);
       }
       let v = val_new(lay.ks.map((_, i) => `((${sw} >> ${i}) & 1)`),
         lay.arms![adt.k][0]);
@@ -4895,6 +5671,16 @@ export function compile_book(book: Bend.Book): string {
   FL = file_new(main_pure(book), false);
   clo_book(["main"]);
   file_book(["main", ...RUNTIME_ADTS]);
+  nv_book();
+  if (process.env.NV_DUMP) {
+    for (const d of FL.srcs.keys()) {
+      const h = fun_of(d).h;
+      if (h && !(tld_of(d) as any).b) {
+        console.error("DEF", d, JSON.stringify(FL.nv!.P.get(d)), JSON.stringify(FL.nv!.R.get(d)), FL.nv!.top.has(d) ? "TOP" : "", JSON.stringify(FL.nv!.rel.get(d)), FL.nv!.walks.get(d));
+        process.env.NV_DUMP === "2" && console.error("  ", Bend.term_show(Bend.term_lower(h)));
+      }
+    }
+  }
   const us = c_units();
   const all = us.flatMap((u) => u.segs);
   const clos = us.flatMap((u) => [...u.clos]);
