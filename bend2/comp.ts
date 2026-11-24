@@ -4912,11 +4912,14 @@ export function compile_book(book: Bend.Book): string {
   // With lazy forks, an outer spin (one only segments call) whose step
   // runs a loop (a spin that loops or calls one) polls the hungry pool at
   // each step: a light step would pay the test, and clang could no longer
-  // fold or widen its loop. With such a spin and no other forks, a turn
-  // with idle threads starts with no grow (Lazy forks).
+  // fold or widen its loop. When such a spin is a leaf of a def that forks
+  // lazily and no fork is eager, a turn with idle threads starts with no
+  // grow (Lazy forks).
   const host = all.filter((s) => !s.native && live.has(s.fid));
   let only = false;
-  if (host.some((s) => s.lines.some((l) => l.includes("WL_FKNOTE(")))) {
+  const forks = new Set(host.filter((s) => s.lines.some((l) =>
+    l.includes("WL_FKNOTE("))).map((s) => s.def));
+  if (forks.size > 0) {
     const calls = (ss: Seg[], f: string) => ss.some((s) => s.fid !== f
       && s.lines.some((l) => l.includes(f + "(")));
     const loops = (s: Seg) => s.lines.some((l) => /\bWL_SPIN\b/.test(l));
@@ -4928,7 +4931,8 @@ export function compile_book(book: Bend.Book): string {
     for (const s of spins.filter((s) => calls(host, s.fid)
       && !calls(spins, s.fid) && loops(s) && inner(s).some(runs))) {
       s.lines = s.lines.map((l) => l.replace(/\bWL_SPIN\b/, "WL_POLL"));
-      only = true;
+      only ||= host.some((h) => forks.has(h.def)
+        && h.lines.some((l) => l.includes(s.fid + "(")));
     }
     only &&= !host.some((s) => FL.eager.has(s.fid));
   }
