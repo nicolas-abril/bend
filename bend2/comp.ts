@@ -3393,10 +3393,13 @@ function emit_unfold(sc: Scope, m: Spine, deep = false): HTerm | null {
     return null;
   }
   const fs = emit_fold_args(sc, m, deep);
-  const doms = tele_unbind(m.tld!.T).doms;
-  const lets = fs.map((a, i) => !m.live[i] || term_const(a)
-    || term_strip(a).$ === "Var" ? null
-    : { p: probe("a"), v: deep ? a : Bend.Ann(a, doms[i][2]) });
+  let T = m.tld!.T;
+  const lets = fs.map((a, i) => {
+    const f = ty_all(T);
+    T = f.B(a);
+    return !m.live[i] || term_const(a) || term_strip(a).$ === "Var" ? null
+      : { p: probe("a"), v: deep ? a : Bend.Ann(a, f.A) };
+  });
   const bad = (y: HTerm): boolean => y.$ === "Lam" || mat_head(y)
     || lets.some((l) => l?.p === y && term_any(l.v, bad));
   let xs = fs.map((a, i) => lets[i]?.p ?? a);
@@ -3427,10 +3430,10 @@ function emit_unfold(sc: Scope, m: Spine, deep = false): HTerm | null {
   }
   // a statement's argument is typed by the arguments before it, as the
   // caller reads its uses
-  let T = m.tld!.T;
+  let D = m.tld!.T;
   lets.forEach((l, i) => {
-    const all = deep ? ty_all(T) : null;
-    T = all?.B(fs[i]) ?? T;
+    const all = deep ? ty_all(D) : null;
+    D = all?.B(fs[i]) ?? D;
     l && all && (l.v = Bend.Ann(l.v, all.A));
   });
   const far = (l: typeof lets[0]) => Number(deep && l && far_call(l.v));
@@ -4572,13 +4575,13 @@ function host(A: HTerm | null, x: string, out: boolean): string {
     : k === "F32" && !out ? `Math.fround(${x})` : x;
 }
 
-// A module (the .bend loader, -o <out>.mjs) roots and exports each callable
-// def by book name: "lib:value" differs from a root "lib.value".
+// A module (the .bend loader, -o <out>.mjs) exports its own callable defs.
 export function js_lib(book: Bend.Book, mod = false): string {
   FL = file_new(book, true);
   const outs = !mod ? null : [...new Set(FL.book.order)].filter((k) => {
     const t = tld_of(k);
-    return done_live(t) && !t.b && t.x === 0 && io_base(FL.book, t.T) === null;
+    return done_live(t) && !t.b && t.x === 0 && io_base(FL.book, t.T) === null
+      && !k.includes(":");
   });
   file_book(outs ?? ["main"]);
   for (const [k, def] of done_defs(fun_runs)) {
@@ -4609,9 +4612,7 @@ export function js_lib(book: Bend.Book, mod = false): string {
     ...entries, ...[...FL.tabs].map(([r, i]) => `const TAB_${i} = [${r}];`)].join("\n")
     + lib;
   // a module's host outlives its book
-  if (mod) {
-    FL = null!;
-  }
+  if (mod) FL = null!;
   return js;
 }
 
