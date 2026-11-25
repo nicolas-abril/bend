@@ -5,15 +5,15 @@
 # node and frees it after, and the cycle's calls, frames and forks move one
 # word. Here: twenty words down a walk (walk), entered at depths 0 and 1 too
 # (shallow), twelve down a fork (pwalk), a Nat and eight words down a fork
-# (nine), two defs that call each other and pass the words in another order
-# (ga, gb), a record and words in one group (mixr), a flag in the group that
-# the walk matches (flag), a closure that takes grouped words (clo) and
-# closures applied after the cycle returns (mkf), a group beside a pinned
-# record (both), one word a self call changes while the rest stay grouped
-# (vary), calls from a tail and from a fork (tail, split), and bang calls
-# into a fork and into two defs that call each other. Counts come from the
-# argument list, so no call is unrolled. Every line is the same at any
-# thread count and on either lane.
+# and into a loop (nine), two defs that call each other and pass the words
+# in another order (ga, gb), a record and words in one group (mixr), a flag
+# in the group that the walk matches (flag), a closure that takes grouped
+# words (clo) and closures applied after the cycle returns (mkf), a group
+# beside a pinned record (both), one word a self call changes while the rest
+# stay grouped (vary), calls from a tail and from a fork (tail, split), and
+# bang calls into a fork and into two defs that call each other. Counts come
+# from the argument list, so no call is unrolled. Every line is the same at
+# any thread count and on either lane.
 import Base
 
 type Small is Data:
@@ -60,11 +60,19 @@ def pwalk(+d: Nat, +a0: U32, +a1: U32, +a2: U32, +a3: U32, +a4: U32,
       l r = pwalk(e, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, U32.add(x, a1)) pwalk(e, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, U32.mul(x, a2))
       U32.xor(l, U32.add(r, a4))
 
+def spin8(+n: Nat, +k0: U32, +k1: U32, +k2: U32, +k3: U32, +k4: U32,
+          +k5: U32, +k6: U32, +k7: U32, +acc: U32) -> U32:
+  match n:
+    case 0n:
+      acc
+    case 1n+m:
+      spin8(m, k0, k1, k2, k3, k4, k5, k6, k7, mix(acc, U32.xor(k0, k6), U32.add(k3, k7)))
+
 def nine(+d: Nat, +i: U32, +n: Nat, +k0: U32, +k1: U32, +k2: U32, +k3: U32,
          +k4: U32, +k5: U32, +k6: U32, +k7: U32) -> U32:
   match d:
     case 0n:
-      mix(U32.add(i, U32.from_nat(n)), U32.xor(k0, k7), U32.add(k3, k5))
+      spin8(n, k0, k1, k2, k3, k4, k5, k6, k7, i)
     case 1n+e:
       a b = nine(e, i, n, k0, k1, k2, k3, k4, k5, k6, k7) nine(e, U32.add(i, U32.shln(1, e)), n, k0, k1, k2, k3, k4, k5, k6, k7)
       U32.add(a, U32.mul(b, k1))
@@ -233,7 +241,7 @@ def main() -> IO(Unit):
 #|472072381
 #|118025556
 #|811794875
-#|139388568
+#|993149276
 #|1791740736
 #|736740096
 #|306468288
