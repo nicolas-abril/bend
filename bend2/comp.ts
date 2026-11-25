@@ -3824,11 +3824,12 @@ function nv_join(a: Nv | null, b: Nv | null): Nv | null {
 }
 
 // old joined with got, after n walks: a bound that keeps moving goes to
-// its end, a low one soon (it moves a step a walk down a countdown), a high
-// one after NV_ROUNDS (a Newton step takes a walk per bit to settle).
-function nv_widen(old: Nv | null, got: Nv | null, n: number): Nv | null {
+// its end after NV_ROUNDS (a Newton step takes a walk per bit to settle),
+// or a low one after low (a countdown takes it a step a walk).
+function nv_widen(old: Nv | null, got: Nv | null, n: number,
+  low = NV_ROUNDS): Nv | null {
   const v = nv_join(old, got);
-  return old === null || v === null ? v : [v[0] < old[0] && n > NV_LOW ? 0
+  return old === null || v === null ? v : [v[0] < old[0] && n > low ? 0
     : v[0], v[1] > old[1] && n > NV_ROUNDS ? NAT_MAX : v[1]];
 }
 
@@ -3992,9 +3993,9 @@ function nv_rel_of(x: HTerm, xs: (HTerm | null)[], doms: Dom[],
   }
   const sides = (a: HTerm): NvSide[] => {
     const c = nv_const(a);
-    return c !== null ? [{ c }] : xs.flatMap((y, i) => y !== null && y !== x
-      && ty_adt(doms[i]?.[2] ?? null)?.k === "Nat" && term_same(a, y)
-      ? [{ p: i }] : []);
+    return [...c !== null ? [{ c }] : [], ...xs.flatMap((y, i) => y !== null
+      && y !== x && ty_adt(doms[i]?.[2] ?? null)?.k === "Nat"
+      && term_same(a, y) ? [{ p: i }] : [])];
   };
   return sides(m.args[0]).flatMap((a) => sides(m.args[1]).map((b) =>
     ({ op, a, b })));
@@ -4062,7 +4063,9 @@ function nv_def(k: Name): void {
     const got = T < Infinity && grow
       ? nv_cap(E[j]![0], E[j]![1] + T * B)
       : cx.vs.reduce((a, vs) => nv_join(a, vs[j]), E[j]);
-    return nv_widen(old, got, walks);
+    // a low bound the loop itself takes down goes soon
+    return nv_widen(old, got, walks, got && got[0] < E[j]![0] ? NV_LOW
+      : NV_ROUNDS);
   });
   st.sink.set(k, nv_sinks(k, cx, P2));
   if (P2.some((v, j) => !nv_same(v, P[j]))) {
@@ -4107,10 +4110,10 @@ function nv_ev(t: HTerm, ty0: HTerm | null, pend: (NvArg & { p?: number })[],
     }
     case "Lam": {
       const all = ty === null ? null : Bend.tele_open(FL.book, ty);
-      if (all === null) {
+      if (all === null && pend.length > 0) {
         return nv_scan(x);
       }
-      if (all.q.$ === "None") {
+      if (all?.q.$ === "None") {
         const [b, B] = memo(st.erased, x, () => {
           const v: HTerm = Bend.Var(x.k, x.i);
           return [x.f(v), all.B(v)];
@@ -4124,7 +4127,7 @@ function nv_ev(t: HTerm, ty0: HTerm | null, pend: (NvArg & { p?: number })[],
         const clo = cx.clo;
         cx.clo = true;
         env.set(p, NV_TOP);
-        nv_ev(o.b, all.B(DUMMY), [], cx);
+        nv_ev(o.b, all?.B(DUMMY) ?? null, [], cx);
         cx.clo = clo;
         return NV_TOP;
       }
@@ -4137,7 +4140,7 @@ function nv_ev(t: HTerm, ty0: HTerm | null, pend: (NvArg & { p?: number })[],
       if (a.d) {
         cx.steps.set(p, a.d);
       }
-      return nv_ev(o.b, all.B(DUMMY), pend.slice(1), cx);
+      return nv_ev(o.b, all!.B(DUMMY), pend.slice(1), cx);
     }
     case "Let": {
       const o = term_open(x);
@@ -4239,7 +4242,7 @@ function nv_ev(t: HTerm, ty0: HTerm | null, pend: (NvArg & { p?: number })[],
       }
       memo(st.calls, k, () => new Set()).add(cx.k);
       if (k === cx.k && !cx.clo) {
-        cx.selfs.push(as.map((a) => a.x && nv_step(a.x, cx)));
+        cx.selfs.push(as.map((a, j) => a.x && nv_step(a.x, cx, 0, j)));
         cx.vs.push(as.map((a) => a.v));
       } else {
         const E = st.E.get(k)!;
@@ -4367,7 +4370,8 @@ function nv_reads(k: Name, cx: NvCx, j: number): boolean {
 }
 
 // How argument x steps a parameter of the def walked.
-function nv_step(x: HTerm, cx: NvCx, deep = 0): NvStep | "same" | null {
+function nv_step(x: HTerm, cx: NvCx, deep = 0,
+  want?: number): NvStep | "same" | null {
   if (cx.clo || deep > 8) {
     return null;
   }
@@ -4403,7 +4407,8 @@ function nv_step(x: HTerm, cx: NvCx, deep = 0): NvStep | "same" | null {
     const p = g === "same" ? cx.ps.get((term_strip(y) as Of<"Var">).i)!
       : g?.how === "grow" ? g.p : undefined;
     // the amount grown reads nothing p steps to
-    if (p !== undefined && v !== null && !term_any(z, (w) => w.$ === "Var"
+    if (p !== undefined && (want === undefined || p === want) && v !== null
+      && !term_any(z, (w) => w.$ === "Var"
       && (cx.ps.get(w.i) === p || cx.steps.get(w.i)?.p === p))) {
       return { p, c: (g === "same" ? 0 : (g as NvStep).c) + v[1],
         how: "grow" };
@@ -5672,15 +5677,6 @@ export function compile_book(book: Bend.Book): string {
   clo_book(["main"]);
   file_book(["main", ...RUNTIME_ADTS]);
   nv_book();
-  if (process.env.NV_DUMP) {
-    for (const d of FL.srcs.keys()) {
-      const h = fun_of(d).h;
-      if (h && !(tld_of(d) as any).b) {
-        console.error("DEF", d, JSON.stringify(FL.nv!.P.get(d)), JSON.stringify(FL.nv!.R.get(d)), FL.nv!.top.has(d) ? "TOP" : "", JSON.stringify(FL.nv!.rel.get(d)), FL.nv!.walks.get(d));
-        process.env.NV_DUMP === "2" && console.error("  ", Bend.term_show(Bend.term_lower(h)));
-      }
-    }
-  }
   const us = c_units();
   const all = us.flatMap((u) => u.segs);
   const clos = us.flatMap((u) => [...u.clos]);

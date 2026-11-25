@@ -21,12 +21,15 @@ def small(+k: Nat) -> Nat:
 def twice(+a: Nat, +b: Nat) -> Nat:
   Nat.add(Nat.mod(a, b), Nat.mod(a, b))
 
+def run(+k: Nat, +a: Nat) -> Nat:
+  twice(a, small(k))
+
 def main() -> IO(Unit):
   do IO<Unit>:
     xs : List<String> <- IO.args()
-    +b : Nat = small(List.length(&1, String, xs))
-    IO.print(Nat.show(twice(9n, b)))
-    IO.print(Nat.show(twice(top(), b)))
+    +k : Nat = List.length(&1, String, xs)
+    IO.print(Nat.show(run(k, 9n)))
+    IO.print(Nat.show(run(k, top())))
 
 #|18
 #|bend: a Nat past the largest immediate 2^48-1

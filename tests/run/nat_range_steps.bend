@@ -1,13 +1,15 @@
 # A loop's turns are bounded by a parameter only if every self-call steps
-# it down (C lane): here one arm passes i back as it is, so i bounds no
-# turns and the sum of a third of 2^48-1 per turn keeps its test. One turn
-# on i and three on j: four thirds pass the limit.
+# it down (C lane): here one arm passes i on as 1 + its predecessor, so i
+# bounds no turns and the sum of a third of 2^48-1 per turn keeps its test.
+# One turn on i and two or three on j: three thirds land on the limit, four
+# pass it.
 import Base
 
 def third() -> Nat:
   Nat.mul(5592405n, 16777217n)
 
-def loop(+i: Nat, +j: Nat, acc: Nat) -> Nat:
+@unsafe
+def loop(+i: Nat, +j: Nat, +acc: Nat) -> Nat:
   match i:
     case 0n:
       acc
@@ -16,7 +18,7 @@ def loop(+i: Nat, +j: Nat, acc: Nat) -> Nat:
         case 0n:
           loop(p, 0n, Nat.add(acc, third()))
         case 1n+q:
-          loop(i, q, Nat.add(acc, third()))
+          loop(Nat.add(p, 1n), q, Nat.add(acc, third()))
 
 def main() -> IO(Unit):
   do IO<Unit>:
