@@ -5039,8 +5039,12 @@ function c_units(): Unit[] {
     was = FL.facts.size;
     FL.units.forEach(unit_emit);
     const us = [...FL.units.values()];
+    // a def and its copy (grp_defs) share their body, so a parameter one
+    // of them is lent is lent to both
     const lent = graph_close(new Set(us.flatMap((u) => [...u.lent])),
-      us.flatMap((u) => u.lends.map(([at, r]) => [r, at])));
+      [...us.flatMap((u) => u.lends.map(([at, r]) => [r, at])),
+        ...[...FL.grpof].flatMap(([d, dg]) => fun_of(d).lays.flatMap((_, i) =>
+          [[arg_key(d, i), arg_key(dg, i)], [arg_key(dg, i), arg_key(d, i)]]))]);
     for (const [k] of done_defs()) {
       brw_of(k).forEach((b, i) => b && !lent.has(arg_key(k, i))
         && fact_add("own", arg_key(k, i)));
