@@ -16,7 +16,12 @@ import * as Bend from "./bend.ts";
 
 type Kind = "w32" | "w64" | "box";
 
-type Lay = { ks: Kind[]; arms: Record<Name, Lay[]> | null };
+type Lay = { ks: Kind[]; arms: Record<Name, Lay[]> | null; grp?: Grp;
+  free?: number };
+
+// A grouped parameter of a pinned copy (pin_grp): no word of its own, its
+// words at off in the node that the binding ptr (GRP_PTR) holds.
+type Grp = { off: number; lay: Lay; ptr: Of<"Var"> };
 
 type Val = { ws: string[]; lay: Lay; stat: boolean; rs: (string | null)[];
   iv?: Iv };
@@ -155,6 +160,8 @@ const W32: Lay = { ks: ["w32"], arms: null };
 
 const BOX: Lay = { ks: ["box"], arms: null };
 
+const NONE: Lay = { ks: [], arms: null };
+
 const W64: Lay = { ks: ["w64"], arms: null };
 
 const WORDS: Record<string, Lay> = Object.setPrototypeOf(
@@ -164,7 +171,13 @@ const WIDE = 247;
 
 const PIN_MIN = 12;
 
+// A group's node costs its reads a load on the way to their words: where
+// each call waits on the last (no fork inside the cycle), it pays from 20.
+const GRP_MIN = 20;
+
 const PIN_VAR = "~pin";
+
+const GRP_PTR = "~grp";
 
 const ERRS = ("|*|*|out of memory: run again with a bigger span, as in"
   + " +RTS --gpu 8GB|a function the device does not hold|a Nat past the"
@@ -1161,17 +1174,24 @@ function brw_of(k: Name): boolean[] {
 // A record parameter of PIN_MIN words or more, words alone, of a def that
 // is not flat, is a borrowed box in d~pin, a copy of the def, when the def
 // is in a cycle of calls whose every call to it inside the cycle passes it
-// such a parameter of the caller. A call from outside hands its words to
+// such a parameter of the caller. Other parameters of words alone that the
+// cycle passes so, PIN_MIN words or more in all, are a group (pin_grp): in
+// the copy one of them takes a node of all their words, the others no word. A call from outside hands its words to
 // the def itself, whose first call into the cycle boxes them (pin_box) and
 // drops the box after; inside, the copies' calls, frames and forks move one
 // word, and their reads peek the node (pin_route). A cycle pins if one of
 // its calls inside it is not a tail (a tail loop holds the words in place),
 // or if it hands a pinned parameter on to a cycle that pins. An own fact
 // gives the copies their words back.
-type PinSite = { d: Name; tail: boolean; from: number[] };
+type PinSite = { d: Name; tail: boolean; fork: boolean; from: number[] };
 
-// The calls in k's body: the callee, whether in a tail, and per argument
-// the parameter of k it passes as it is (-1 for any other).
+type Slot = { i: number; off: number; lay: Lay };
+
+type Cycle = { ds: Set<Name>; ps: Set<string>; sites: Map<Name, PinSite[]>;
+  on: boolean; gs?: Map<Name, Slot[]>; cls?: number };
+
+// The calls in k's body: the callee, whether in a tail or a fork, and per
+// argument the parameter of k it passes as it is (-1 for any other).
 function pin_sites(k: Name): PinSite[] | null {
   const f = fun_of(k);
   const doms = tele_unbind(tld_of(k).T).doms.slice(0, f.n);
@@ -1181,10 +1201,14 @@ function pin_sites(k: Name): PinSite[] | null {
     return null;
   }
   const out: PinSite[] = [];
+  const forks = new Set<HTerm>();
   tr.leaves.forEach((pv, l) => term_any(l, (s, tail) => {
     const m = term_spine(s);
+    if (s.$ === "Let" && s.k.length > 1) {
+      s.v.forEach((v) => forks.add(term_strip(v)));
+    }
     if (s.$ === "App" && m.k !== null && m.k !== CLO_APPLY) {
-      out.push({ d: m.k, tail, from: m.xs.map((a) => {
+      out.push({ d: m.k, tail, fork: forks.has(s), from: m.xs.map((a) => {
         const v = term_strip(a);
         return v.$ === "Var" ? live.indexOf(pv.indexOf(v.i)) : -1;
       }) });
@@ -1205,13 +1229,16 @@ function pin_defs(): void {
     return tld?.$ === "ADT" && tld.c.length === 1 && !OWNED.includes(adt.k)
       && !flat_of(k);
   };
-  type Cycle = { ds: Set<Name>; ps: Set<string>; sites: Map<Name, PinSite[]>;
-    on: boolean };
   const cycles: Cycle[] = [];
   const seen = new Set<Name>();
+  const words = (k: Name, i: number): number => {
+    const l = fun_of(k).lays[i];
+    return l.ks.includes("box") ? 0 : l.ks.length;
+  };
   for (const [k] of done_defs()) {
-    if (seen.has(k) || !fun_of(k).lays.some((_, i) => wide(k, i))
-      || !def_reach_set(k).has(k)) {
+    if (seen.has(k) || flat_of(k) || !(fun_of(k).lays.some((_, i) =>
+      wide(k, i)) || fun_of(k).lays.reduce((n, _, i) => n + words(k, i), 0)
+      >= PIN_MIN) || !def_reach_set(k).has(k)) {
       continue;
     }
     const ds = new Set([k, ...[...def_reach_set(k)].filter((d) =>
@@ -1234,8 +1261,12 @@ function pin_defs(): void {
           && !(i >= 0 && c.ps.has(arg_key(a, i)))
           && (c.ps.delete(arg_key(s.d, j)), cut = true))));
     }
-    c.on = c.ps.size > 0 && [...c.sites.values()].some((ss) =>
+    const deep = [...c.sites.values()].some((ss) =>
       ss.some((s) => ds.has(s.d) && !s.tail));
+    c.on = c.ps.size > 0 && deep;
+    if (deep) {
+      pin_grp(c, (d, i) => words(d, i) > 0 && !c.ps.has(arg_key(d, i)));
+    }
     cycles.push(c);
   }
   const pinned = (key: string) => cycles.some((c) => c.on && c.ps.has(key));
@@ -1249,22 +1280,141 @@ function pin_defs(): void {
       }
     }
   }
-  cycles.filter((c) => c.on).forEach((c, id) => {
+  cycles.filter((c) => c.on || c.gs).forEach((c, id) => {
     const all: [Name, number, Lay][] = [];
+    const ps = c.on ? c.ps : new Set<string>();
     for (const d of c.ds) {
-      const f = fun_of(d), dp = d + "~pin";
+      const f = fun_of(d), dp = d + "~pin", gs = c.gs?.get(d) ?? [];
       FL.pincyc.set(d, id).set(dp, id);
-      if (f.lays.some((_, i) => c.ps.has(arg_key(d, i)))) {
-        FL.pinof.set(d, dp);
-        FL.made[dp] = tld_of(d);
-        FL.srcs.set(dp, FL.srcs.get(d) ?? null);
-        FL.funs.set(dp, { ...f, lays: f.lays.map((l, i) =>
-          c.ps.has(arg_key(d, i)) ? (all.push([dp, i, l]),
-          FL.pinty.add(ty_adt(f.live[i][2])!.k), BOX) : l) });
+      if (gs.length === 0 && !f.lays.some((_, i) => ps.has(arg_key(d, i)))) {
+        continue;
       }
+      FL.pinof.set(d, dp);
+      FL.made[dp] = tld_of(d);
+      FL.srcs.set(dp, FL.srcs.get(d) ?? null);
+      if (gs.length > 0) {
+        FL.grps.set(dp, { gs, cls: c.cls! });
+      }
+      FL.funs.set(dp, { ...f, lays: f.lays.map((l, i) => {
+        const g = gs.findIndex((x) => x.i === i);
+        return g === 0 ? W64 : g > 0 ? NONE : !ps.has(arg_key(d, i)) ? l
+          : (all.push([dp, i, l]), FL.pinty.add(ty_adt(f.live[i][2])!.k), BOX);
+      }) });
     }
     all.forEach(([k, i]) => FL.pins.set(arg_key(k, i), all));
   });
+}
+
+// A cycle's group: the parameters that pass (ok) and that every call inside
+// the cycle passes a parameter of the caller in the same slot, a slot being
+// the parameters such calls join. Each def holding any holds each slot once,
+// all the same slots, PIN_MIN words or more (GRP_MIN in a cycle that does
+// not fork inside); a slot has one offset in the node, and a def's first
+// grouped parameter takes the node.
+function pin_grp(c: Cycle, ok: (d: Name, i: number) => boolean): void {
+  const gs = new Set<string>();
+  c.ds.forEach((d) => fun_of(d).lays.forEach((_, i) => ok(d, i)
+    && gs.add(arg_key(d, i))));
+  for (let cut = true; cut;) {
+    cut = false;
+    c.sites.forEach((ss, a) => ss.forEach((s) => c.ds.has(s.d)
+      && s.from.forEach((i, j) => gs.has(arg_key(s.d, j))
+        && !(i >= 0 && gs.has(arg_key(a, i)))
+        && (gs.delete(arg_key(s.d, j)), cut = true))));
+  }
+  const up = new Map<string, string>();
+  const root = (x: string): string => up.has(x) ? root(up.get(x)!) : x;
+  c.sites.forEach((ss, a) => ss.forEach((s) => c.ds.has(s.d)
+    && s.from.forEach((i, j) => {
+      const [x, y] = [root(arg_key(a, i)), root(arg_key(s.d, j))];
+      gs.has(arg_key(s.d, j)) && x !== y && up.set(x, y);
+    })));
+  const of = new Map<Name, Map<string, number>>();
+  for (const key of gs) {
+    const at = key.lastIndexOf("~");
+    const m = memo(of, key.slice(0, at), () => new Map<string, number>());
+    if (m.has(root(key))) {
+      return;
+    }
+    m.set(root(key), Number(key.slice(at + 1)));
+  }
+  const [d0, m0] = [...of][0] ?? [];
+  const lay = (d: Name, r: string) => fun_of(d).lays[of.get(d)!.get(r)!];
+  if (!m0 || [...of].some(([d, m]) => m.size !== m0.size
+    || [...m0.keys()].some((r) => !m.has(r) || !lay_eq(lay(d, r), lay(d0, r))))) {
+    return;
+  }
+  let n = 0;
+  const offs = new Map([...m0.keys()].map((r) =>
+    [r, (n += lay(d0, r).ks.length) - lay(d0, r).ks.length]));
+  const fork = [...c.sites.values()].some((ss) =>
+    ss.some((s) => c.ds.has(s.d) && s.fork));
+  if (n >= (fork ? PIN_MIN : GRP_MIN)) {
+    c.cls = cls_fit(n);
+    c.gs = new Map([...of].map(([d, m]) => [d, [...m].map(([r, i]) =>
+      ({ i, off: offs.get(r)!, lay: lay(d, r) })).sort((x, y) => x.i - y.i)]));
+  }
+}
+
+// A grouped parameter's words, read off its node.
+function grp_read(sc: Scope, v: Val): Val {
+  const { off, lay, ptr } = v.lay.grp!;
+  const nd = sc.uses.get(ptr)!.val.ws[0];
+  return val_new(lay.ks.map((kd, j) =>
+    `${kd === "w32" ? "(u32)" : ""}e.mem[${nd} + ${off + j}]`), lay);
+}
+
+// A copy's parameters as it holds them: the node's word in a binding of
+// its own, which lives while a grouped parameter does.
+function grp_vals(sc: Scope, k: Name, vals: Val[]): Val[] {
+  const g = FL.grps.get(k);
+  if (!g) {
+    return vals;
+  }
+  const ptr = probe(GRP_PTR);
+  sc.uses.set(ptr, { val: vals[g.gs[0].i], n: 1,
+    A: fun_of(k).live[g.gs[0].i][2] });
+  return vals.map((v, i) => {
+    const x = g.gs.find((y) => y.i === i);
+    return x ? val_new([], { ...NONE, grp: { off: x.off, lay: x.lay, ptr } })
+      : v;
+  });
+}
+
+// Whether a call to a copy hands it its group's node: each grouped argument
+// a grouped parameter at the same offset.
+function grp_held(sc: Scope, ck: Spine): boolean {
+  return FL.grps.get(ck.k!)!.gs.every(({ i, off }) => {
+    const x = term_strip(ck.xs[i]);
+    return x.$ === "Var" && sc.uses.get(probe_of(x))?.val.lay.grp?.off === off;
+  });
+}
+
+// A call to a copy with a group passes the group's node on, or builds one
+// from its words: a binding of its own, which the caller's next frame keeps
+// and its continuation frees (a tail call that builds one is a cut).
+function grp_args(sc: Scope, ck: Spine, vs: (Val | null)[]): Map<number, Val> {
+  const { gs, cls } = FL.grps.get(ck.k!)!;
+  const xs = ck.xs.map(term_strip);
+  let nd: string;
+  if (grp_held(sc, ck)) {
+    nd = sc.uses.get(sc.uses.get(probe_of(xs[gs[0].i]))!.val.lay.grp!.ptr)!
+      .val.ws[0];
+    gs.forEach(({ i }) => {
+      const p = probe_of(xs[i]);
+      bind_set(sc, p, sc.uses.get(p)!, sc.uses.get(p)!.n - 1);
+    });
+  } else {
+    const ws = gs.map(({ i, lay }) =>
+      val_own(val_to(sc, vs[i] ?? bind_pop(sc, xs[i], lay), lay)));
+    nd = name_local(sc, "grp");
+    file_push(sc, `u64 ${nd} = heap_alloc(e, ${cls});`, ...gs.flatMap(
+      ({ off }, j) => ws[j].map((w, q) => `e.mem[${nd} + ${off + q}] = ${w};`)));
+    sc.uses.set(probe(PIN_VAR), { val: val_new([nd], { ...W64, free: cls }),
+      n: 1, A: fun_of(ck.k!).live[gs[0].i][2] });
+  }
+  return new Map(gs.map(({ i }, j) =>
+    [i, val_new(j === 0 ? [nd] : [], j === 0 ? W64 : NONE)]));
 }
 
 // A call into a pinned cycle goes to the copies from inside the cycle, or
@@ -1277,12 +1427,13 @@ function pin_route(sc: Scope, ck: Spine, inside = true): Spine {
       const x = term_strip(a);
       return !FL.pins.has(arg_key(dp, i)) || x.$ === "Var"
         && sc.uses.get(probe_of(x))?.val.lay === BOX;
-    })) ? { ...ck, k: dp } : ck;
+    }) && (!FL.grps.has(dp) || grp_held(sc, { ...ck, k: dp })))
+    ? { ...ck, k: dp } : ck;
 }
 
 // Whether a copy still takes a box (an own fact gives it its words back).
 function pin_live(dp: Name): boolean {
-  return fun_of(dp).lays.some((_, i) => pin_at(dp, i));
+  return FL.grps.has(dp) || fun_of(dp).lays.some((_, i) => pin_at(dp, i));
 }
 
 // The def a copy (d~pin) copies.
@@ -1300,11 +1451,12 @@ function pin_at(k: Name, i: number): boolean {
 // or, with lent, hands it a box its caller owns: a tail call either way
 // would leave the box to the callee, so it is a cut, and the caller drops it.
 function pin_fresh(sc: Scope, ck: Spine, lent = false): boolean {
-  return ck.k !== null && ck.xs.some((a, i) => {
+  return ck.k !== null && (FL.grps.has(ck.k) && !grp_held(sc, ck)
+    || ck.xs.some((a, i) => {
     const x = term_strip(a);
     const v = x.$ === "Var" ? sc.uses.get(probe_of(x))?.val : undefined;
     return pin_at(ck.k!, i) && (v?.lay !== BOX || lent && v.rs[0] === null);
-  });
+  }));
 }
 
 // A slot parameter is a flat pair of an Array and a value: the array word is
@@ -2102,6 +2254,7 @@ function file_new(book: Bend.Book, js: boolean) {
     pinty: new Set<Name>(),
     pinof: new Map<Name, Name>(),
     pincyc: new Map<Name, number>(),
+    grps: new Map<Name, { gs: Slot[]; cls: number }>(),
     cols: new Map<HTerm, Map<string, Cols>>(),
     etas: new Map<HTerm, [HTerm, HTerm | null][]>(),
     dst: false,
@@ -2605,6 +2758,11 @@ function arr_leaf(sc: Scope, s: string, el: Lay): Val {
 function bind_pop(sc: Scope, x: HTerm, at: Lay | null): Val {
   const p = probe_of(x);
   const b = sc.uses.get(p)!;
+  if (b.val.lay.grp) {
+    const v = grp_read(sc, b.val);
+    bind_set(sc, p, b, b.n - 1);
+    return v;
+  }
   if (b.n <= 1) {
     sc.uses.delete(p);
     return b.val;
@@ -2644,8 +2802,15 @@ function bind_uses(sc: Scope, p: Of<"Var">, v: Val, rest: HTerm[],
 function bind_set(sc: Scope, p: Of<"Var">, b: Bind, n: number): void {
   const adt = val_owned(b.val).length > 0 && b.val.lay === BOX
     ? ty_adt(b.A) : null;
-  if (n > 0) {
+  if (p.k === GRP_PTR) {
+    // the node's word, borrowed, lives on with the copy's body
+    sc.uses.set(p, { ...b, n: 1 });
+  } else if (n > 0) {
     sc.uses.set(p, { ...b, n });
+  } else if (b.val.lay.free !== undefined) {
+    // (a join run in sequence is handed 0 for a node only its tasks built)
+    sc.uses.delete(p);
+    file_push(sc, `spare_free(e, ${b.val.lay.free}, ${b.val.ws[0]});`);
   } else if (adt && FL.pinty.has(adt.k)) {
     sc.uses.delete(p);
     const k = (tld_of(adt.k) as Bend.ADT).c[0].k, w = b.val.ws[0];
@@ -3046,9 +3211,12 @@ function emit_args(sc: Scope, ck: Spine, jump = false, fork = false,
   ck.all.forEach((a, q) =>
     fact("arg", arg_key(k, q)) && facts_hot(sc.def, a, true));
   const vars = xs.filter((x) => x.$ === "Var");
+  const g = FL.grps.get(k);
+  const at = (i: number) => g?.gs.find((y) => y.i === i)?.lay ?? lays[i];
   const vs = ck.xs.map((a, i) => xs[i].$ === "Var" ? null
     : emit_expr({ ...sc, rest: [...xs.slice(i + 1).filter((x) =>
-      x.$ !== "Var"), ...vars, ...sc.rest] }, a, null, lays[i]));
+      x.$ !== "Var"), ...vars, ...sc.rest] }, a, null, at(i)));
+  const gout = g ? grp_args(sc, ck, vs) : new Map<number, Val>();
   xs.forEach((x, i) => {
     if (pin_at(k, i)) {
       xs[i] = pin_box(sc, x, vs[i], live[i][2]);
@@ -3058,13 +3226,17 @@ function emit_args(sc: Scope, ck: Spine, jump = false, fork = false,
   });
   // A flat def that does not loop is lent an owned box its caller still
   // uses: the def keeps it where it owns it.
-  xs.forEach((x, i) => vs[i] ??= brw[i] || lend && (lend[i] = !!live[i]
+  xs.forEach((x, i) => gout.has(i) || (vs[i] ??= brw[i] || lend
+    && (lend[i] = !!live[i]
     && lays[i] === BOX && sc.uses.get(probe_of(x))!.val.lay === BOX
     && (ty_adt(live[i][2])?.k ?? "Array") !== "Array"
     && loop_of(k).length === 0 && rest_use(sc.rest, probe_of(x)) > 0
     && val_owned(sc.uses.get(probe_of(x))!.val).length > 0) ? null
-    : bind_pop(sc, x, lays[i]));
+    : bind_pop(sc, x, lays[i])));
   const out = xs.map((x, i) => {
+    if (gout.has(i)) {
+      return gout.get(i)!;
+    }
     const at = arg_key(k, i);
     let b = vs[i];
     if (b === null) {
@@ -3475,7 +3647,8 @@ function emit_open(k: Name, lend: boolean[] = []): [Scope, Val[]] {
   const { live, lays, ret } = fun_of(k);
   const vals = def_vals(k, lays.map((l, i) => l.ks.map(() =>
     name_local(sc, live[i]?.[1] ?? "k"))), lend);
-  return [{ ...sc, seg: seg_new(k, ret, vals), def: k }, vals];
+  return [{ ...sc, seg: seg_new(k, ret, vals), def: k },
+    grp_vals(sc, k, vals)];
 }
 
 // Def k's parameters over the words ws, as k holds them: a borrowed one is
@@ -3916,6 +4089,9 @@ function emit_intr(sc: Scope, k: Name, m: Spine, ty: HTerm | null): Val {
 }
 
 function emit_clo(sc: Scope, x: HTerm, ty: HTerm | null): Val {
+  // it may outlive a group's node: it takes the words
+  [...sc.uses].forEach(([p, b]) => b.val.lay.grp && rest_use([x], p) > 0
+    && sc.uses.set(p, { ...b, val: val_hold(sc, grp_read(sc, b.val), p.k) }));
   const live = [...sc.uses].filter(([p]) => rest_use([x], p) > 0);
   live.forEach(([p, b]) => {
     sc.uses.set(p, { ...b, n: b.n - rest_use([x], p) + 1 });
@@ -4259,7 +4435,8 @@ function emit_body(sc: Scope, tm: HTerm, ty0: HTerm | null, args: Val[],
       const o = term_open(x);
       const at = lay_at(all.A, args[0]);
       const lay = lay_lazy(args[0], at) ? BOX : at;
-      const held = val_hold(sc, val_to(sc, args[0], lay), x.k);
+      const held = args[0].lay.grp ? args[0]
+        : val_hold(sc, val_to(sc, args[0], lay), x.k);
       ix_bind(sc, o.ps[0], held, args[0]);
       bind_uses(sc, o.ps[0], held, [o.b], all.A);
       return emit_body(sc, o.b, all.B(DUMMY), args.slice(1), dst);
@@ -4310,7 +4487,7 @@ function emit_body(sc: Scope, tm: HTerm, ty0: HTerm | null, args: Val[],
           ? emit_put(sc, dst, inl_q(sc, ck) ? emit_inl(sc, ck)
             : emit_spin(sc, ck))
           : emit_body({ ...sc, def: ck.k }, h!, ck.tld!.T,
-            emit_args(sc, ck, true), dst);
+            grp_vals(sc, ck.k!, emit_args(sc, ck, true)), dst);
       }
       // a cut where the results' lays differ, or where a tail call would
       // leave the callee a box (pin_fresh)
@@ -4381,8 +4558,9 @@ function emit_fork(sc: Scope, x: Of<"Let">): void {
       const margs = calls.map((c, j) => emit_args({ ...pl,
         rest: [...x.v.filter((_, i) => i !== j), o.b] }, c, false, true)
         .flatMap((v) => v.ws));
-      hold = new Map([...pl.uses].filter(([p, b]) =>
-        val_owned(b.val).length > 0 || rest_use([o.b], p) > 0));
+      hold = new Map([...pl.uses].filter(([p, b]) => p.k === PIN_VAR
+        || p.k === GRP_PTR || val_owned(b.val).length > 0
+        || rest_use([o.b], p) > 0));
       const caps = [...hold.values()].flatMap((b) => b.val.ws);
       const jn = emit_task(pl, seg_fid(name), calls.length, caps);
       const jt = `term_tsk(${seg_fid(name)}, ${jn})`;
@@ -4569,6 +4747,9 @@ function emit_match(sc: Scope, x: Of<"Mat"> | Of<"Efq">,
   if (x.$ === "Efq") {
     spare_flush(sc);
     return file_push(sc, "err_post(e.mem, ERR_TAGS);", "return 0;");
+  }
+  if (args[0]?.lay.grp) {
+    args = [grp_read(sc, args[0]), ...args.slice(1)];
   }
   const self = probe("s");
   const { adt, ret, rows, cells } = mat_rows(sc, x, ty, self);
