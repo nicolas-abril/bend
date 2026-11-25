@@ -4804,16 +4804,18 @@ function segs_base(segs: Seg[], dev: Set<string>): void {
       }
     }
   }
-  // A tail call into a tree runs the callee's answering arms itself (host
-  // only): their return is the callee's, on the same stack, so the common
+  // A tail call into a tree runs the callee's answering arm itself (host
+  // only): its return is the callee's, on the same stack, so the common
   // return of a continuation that resumes the recursion (ack_k1 into ack)
-  // takes one branch, not two. Arms of more than 48 lines in all stay
-  // (perceus deriv's mul has 1,550).
+  // takes one branch, not two. Only a callee with one answering arm of at
+  // most 48 lines: with two, a miss runs the tests again in the callee
+  // (fib_acc_k1: +8.5% cycles at every code position; respelled pascal +20%).
   for (const { lines: ls } of segs) {
     for (let i = ls.length; i-- > 0;) {
       const m = ls[i].match(/^( *)\/\/tail (\S+)$/);
       const a = m && arms.get(m[2]);
-      const b = a && a.length <= 48 ? a : null;
+      const b = a && a.length <= 48
+        && a.filter((x) => /WL_RETN/.test(x)).length === 1 ? a : null;
       m && ls.splice(i, 1, ...b ? seg_text(["if (!DEVICE) {",
         ...b.map((x) => "  " + x), "}"], m[1].length / 2) : []);
     }
