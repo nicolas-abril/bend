@@ -162,7 +162,7 @@ const WORDS: Record<string, Lay> = Object.setPrototypeOf(
 
 const WIDE = 247;
 
-const PIN_MIN = 8;
+const PIN_MIN = 12;
 
 const PIN_VAR = "~pin";
 
@@ -1159,13 +1159,15 @@ function brw_of(k: Name): boolean[] {
 }
 
 // A record parameter of PIN_MIN words or more, words alone, of a def that
-// is not flat, is a borrowed box when the def is in a cycle of calls whose
-// every call to it inside the cycle passes it such a parameter of the
-// caller: a call from outside boxes it once and drops it after (pin_box),
-// and the cycle's calls, frames and forks move one word; its reads peek the
-// node. A cycle pins if one of its calls inside it is not a tail (a tail
-// loop holds the words in place), or if it hands a pinned parameter on to
-// a cycle that pins. An own fact gives a parameter its words back.
+// is not flat, is a borrowed box in d~pin, a copy of the def, when the def
+// is in a cycle of calls whose every call to it inside the cycle passes it
+// such a parameter of the caller. A call from outside hands its words to
+// the def itself, whose first call into the cycle boxes them (pin_box) and
+// drops the box after; inside, the copies' calls, frames and forks move one
+// word, and their reads peek the node (pin_route). A cycle pins if one of
+// its calls inside it is not a tail (a tail loop holds the words in place),
+// or if it hands a pinned parameter on to a cycle that pins. An own fact
+// gives the copies their words back.
 type PinSite = { d: Name; tail: boolean; from: number[] };
 
 // The calls in k's body: the callee, whether in a tail, and per argument
@@ -1247,17 +1249,46 @@ function pin_defs(): void {
       }
     }
   }
-  for (const c of cycles.filter((c) => c.on)) {
-    const all = [...c.ps].map((key): [Name, number, Lay] => {
-      const at = key.lastIndexOf("~");
-      const [k, i] = [key.slice(0, at), Number(key.slice(at + 1))];
-      return [k, i, fun_of(k).lays[i]];
-    });
-    all.forEach(([k, i]) => {
-      FL.pins.set(arg_key(k, i), all);
-      fun_of(k).lays[i] = BOX;
-    });
-  }
+  cycles.filter((c) => c.on).forEach((c, id) => {
+    const all: [Name, number, Lay][] = [];
+    for (const d of c.ds) {
+      const f = fun_of(d), dp = d + "~pin";
+      FL.pincyc.set(d, id).set(dp, id);
+      if (f.lays.some((_, i) => c.ps.has(arg_key(d, i)))) {
+        FL.pinof.set(d, dp);
+        FL.made[dp] = tld_of(d);
+        FL.srcs.set(dp, FL.srcs.get(d) ?? null);
+        FL.funs.set(dp, { ...f, lays: f.lays.map((l, i) =>
+          c.ps.has(arg_key(d, i)) ? (all.push([dp, i, l]),
+          FL.pinty.add(ty_adt(f.live[i][2])!.k), BOX) : l) });
+      }
+    }
+    all.forEach(([k, i]) => FL.pins.set(arg_key(k, i), all));
+  });
+}
+
+// A call into a pinned cycle goes to the copies from inside the cycle, or
+// when it holds the boxes already; from outside it goes to the def itself.
+function pin_route(sc: Scope, ck: Spine): Spine {
+  const dp = ck.k === null || ck.b ? undefined : FL.pinof.get(ck.k);
+  return dp !== undefined && pin_live(dp)
+    && (FL.pincyc.get(sc.def) === FL.pincyc.get(ck.k)
+    || ck.xs.every((a, i) => {
+      const x = term_strip(a);
+      return !FL.pins.has(arg_key(dp, i)) || x.$ === "Var"
+        && sc.uses.get(probe_of(x))?.val.lay === BOX;
+    })) ? { ...ck, k: dp } : ck;
+}
+
+// Whether a copy still takes a box (an own fact gives it its words back).
+function pin_live(dp: Name): boolean {
+  return fun_of(dp).lays.some((_, i) => pin_at(dp, i));
+}
+
+// The def a copy (d~pin) copies.
+function tld_name(k: Name): Name {
+  return k.endsWith("~pin") && FL.pinof.get(k.slice(0, -4)) === k
+    ? k.slice(0, -4) : k;
 }
 
 function pin_at(k: Name, i: number): boolean {
@@ -2068,6 +2099,9 @@ function file_new(book: Bend.Book, js: boolean) {
     cnts: new Map<Name, number[]>(),
     pins: new Map<string, [Name, number, Lay][]>(),
     reach: new Map<Name, Set<Name>>(),
+    pinty: new Set<Name>(),
+    pinof: new Map<Name, Name>(),
+    pincyc: new Map<Name, number>(),
     cols: new Map<HTerm, Map<string, Cols>>(),
     etas: new Map<HTerm, [HTerm, HTerm | null][]>(),
     dst: false,
@@ -2604,9 +2638,20 @@ function bind_uses(sc: Scope, p: Of<"Var">, v: Val, rest: HTerm[],
   bind_set(sc, p, { val: v, n, A }, n);
 }
 
+// A box of a pinned record holds words alone: uncounted, it is the
+// binding's own, and its node goes back to the heap as it is (a constant
+// record's stays).
 function bind_set(sc: Scope, p: Of<"Var">, b: Bind, n: number): void {
+  const adt = val_owned(b.val).length > 0 && b.val.lay === BOX
+    ? ty_adt(b.A) : null;
   if (n > 0) {
     sc.uses.set(p, { ...b, n });
+  } else if (adt && FL.pinty.has(adt.k)) {
+    sc.uses.delete(p);
+    const k = (tld_of(adt.k) as Bend.ADT).c[0].k, w = b.val.ws[0];
+    file_push(sc, `if (term_rfc(${w})) {`, `  term_sink(e, ${w});`, "} else {",
+      `  spare_free(e, ${cls_fit(node_pack(k)?.n ?? lay_node(k).ks.length)
+      }, term_loc(${w}));`, "}");
   } else {
     sc.uses.delete(p);
     val_sink(sc, b.val);
@@ -4243,7 +4288,7 @@ function emit_body(sc: Scope, tm: HTerm, ty0: HTerm | null, args: Val[],
         return emit_body(sc, term_eta(x, ty!, 1), ty, args, dst);
       }
       sc = { ...sc, rest: [] };
-      const ck = term_spine(x);
+      const ck = pin_route(sc, term_spine(x));
       if (ck.k === null) {
         return emit_put(sc, dst, emit_expr(sc, x, ty, dst?.lay ?? sc.seg.ret));
       }
@@ -4321,7 +4366,7 @@ function fork_lazy(k1: [Scope, Seg["frame"], [Of<"Var">, Bind][], Val, HTerm[]],
 
 function emit_fork(sc: Scope, x: Of<"Let">): void {
   const o = term_open(x);
-  const calls = x.v.map(term_spine);
+  const calls = x.v.map((v) => pin_route(sc, term_spine(v)));
   const fork = calls.length > 1;
   const name = seg_name("j");
   let hold = new Map<Of<"Var">, Bind>();
@@ -4380,7 +4425,7 @@ function emit_fork(sc: Scope, x: Of<"Let">): void {
     const kf = seg_fid(kn);
     const on = `WL_SEQ(${sc.seg.fid})`;
     const base = !c.b && !hole && memo(FL.trees, c.k!, (k) =>
-      term_calls(fun_of(k).h ?? DUMMY, k) > 1);
+      term_calls(fun_of(k).h ?? DUMMY, tld_name(k)) > 1);
     if (lazy && i === 1) {
       fork_lazy(k1!, sname, c, chain[1], kf, ws.length, o.ps[0],
         ty_ann(x.v[0])!);
@@ -4867,7 +4912,8 @@ function c_units(): Unit[] {
         && fact_add("own", arg_key(k, i)));
     }
   } while (was !== FL.facts.size);
-  return [...FL.units.values()];
+  return [...FL.units.values()].filter((u) =>
+    tld_name(u.name) === u.name || pin_live(u.name));
 }
 
 // A call that pushed its frame carries a //base line naming its callee and

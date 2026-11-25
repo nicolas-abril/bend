@@ -1,13 +1,13 @@
-# A record parameter that a recursion passes back as it is goes as one
-# borrowed box on the device too: a walk that keeps it over its first call
+# A record parameter that a cycle of calls passes back as it is goes as
+# one borrowed box on the device too: a walk that keeps it over its first call
 # (walk), the same forked (pwalk), and a record of two records and a tag
-# (deep), each run by a bang call that boxes the record it is given. Counts
+# (deep), each run by a bang call that hands it the record's words. Counts
 # come from the argument list, so no call is unrolled. Every line is the
 # same at any thread count and on either lane.
 import Base
 
 type Cfg is Data:
-  Cfg{a: U32, b: U32, c: U32, d: U32, e: U32, f: U32, g: U32, h: U32, n: Nat}
+  Cfg{a: U32, b: U32, c: U32, d: U32, e: U32, f: U32, g: U32, h: U32, i: U32, j: U32, k: U32, m: U32, n: Nat}
 
 type Mode is Data:
   Add{}
@@ -26,12 +26,12 @@ def len(xs: List<String>, acc: Nat) -> Nat:
 
 def mix(r: Cfg, +x: U32) -> U32:
   match r:
-    case Cfg{a, b, c, d, e, f, g, h, n}:
+    case Cfg{a, b, c, d, e, f, g, h, i, j, k, m, n}:
       U32.add(U32.xor(U32.mul(x, a), U32.add(b, h)),
-        U32.mul(U32.xor(x, d), U32.add(U32.from_nat(n), U32.xor(f, g))))
+        U32.mul(U32.xor(x, d), U32.add(U32.from_nat(n), U32.xor(f, U32.add(g, U32.xor(i, U32.add(j, U32.mul(k, m))))))))
 
 def mk(+x: U32, +n: Nat) -> Cfg:
-  Cfg{x, U32.add(x, 1), U32.mul(x, 3), 4, 5, U32.xor(x, 6), 7, 8, n}
+  Cfg{x, U32.add(x, 1), U32.mul(x, 3), 4, 5, U32.xor(x, 6), 7, 8, U32.add(x, 9), 10, U32.mul(x, 11), 12, n}
 
 def walk(+d: Nat, +r: Cfg, +x: U32) -> U32:
   match d:
@@ -83,3 +83,7 @@ def main() -> IO(Unit):
   do IO<Unit>:
     args : List<String> <- IO.args()
     go(len(args, 0n))
+
+#|3897326375
+#|484951231
+#|3103648106
