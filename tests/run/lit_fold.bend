@@ -1,11 +1,12 @@
 # Calls of defs on closed arguments are run at compile time when their value
 # is a small constant: String.length, String.contains and String.starts_with
-# on literals, Nat and U32 arithmetic (U32 wraps), a user def that matches on
-# a literal, a string and a list built from literals, and Bool results. A
-# call whose one open argument calls a def that answers a literal from every
-# arm (score(word(k)), count(word(k), Chr{111})) calls a copy of that def whose
-# arms answer the outer call's values. The rest stay calls: a closed call
-# past the fuel (fib(27n)), a value past the size bound (a 300-char string),
+# on literals, Nat and U32 arithmetic (U32 wraps), user defs that match on a
+# literal, a sum over a list literal, strings built from literals (a literal
+# tail under new characters), and Bool results. A call whose one open
+# argument calls a def that answers a literal from every arm (score(word(k)),
+# count(word(k), Chr{111})) calls a copy of that def whose arms answer the
+# outer call's values. The rest stay calls: closed calls past the fuel
+# (fib(27n), Nat.mul(49n, 343n) in unary, the length of a 300-char string),
 # F32 arithmetic, and calls on open arguments. Sizes come from the argument
 # list, so the open calls are not folded by other means.
 import Base
@@ -105,6 +106,7 @@ def run(+z: Nat) -> IO(Unit):
     Unit <- IO.print(U32.show(U32.add(pick(1n), U32.from_nat(z))))
     Unit <- IO.print(Nat.show(Nat.add(count("foo boo", Chr{111}), z)))
     Unit <- IO.print(String.append("ab", String.append("cd", Nat.show(z))))
+    Unit <- IO.print(String.append("ab", "cd"))
     Unit <- IO.print(Nat.show(Nat.add(sum([1n, 2n, 3n, 40n]), z)))
     Unit <- IO.print(Nat.show(Nat.add(fib(27n), z)))
     Unit <- IO.print(Nat.show(Nat.add(String.length(rep(100n, "abc")), z)))
@@ -128,6 +130,7 @@ def main() -> IO(Unit):
 #|4000000001
 #|5
 #|abcd1
+#|abcd
 #|47
 #|196419
 #|301
