@@ -8,16 +8,28 @@
 # and into a loop (nine), two defs that call each other and pass the words
 # in another order (ga, gb), a record and words in one group (mixr), a flag
 # in the group that the walk matches (flag), a closure that takes grouped
-# words (clo) and closures applied after the cycle returns (mkf), a group
-# beside a pinned record (both), one word a self call changes while the rest
-# stay grouped (vary), calls from a tail and from a fork (tail, split), and
-# bang calls into a fork and into two defs that call each other. Counts come
-# from the argument list, so no call is unrolled. Every line is the same at
-# any thread count and on either lane.
+# words (clo) and closures applied after the cycle returns (mkf), a record
+# and twelve words in one group (both), a record of two records and a tag
+# (deep), a constant record (konst), a record the cycle stores in a list
+# (keep), one word a self call changes while the rest stay grouped (vary), a
+# record a call changes, so it stays words (drift), calls from a tail and
+# from a fork (tail, split), a fork whose second call is the first into the
+# cycle, entered at every level of a walk (fan, fans), and bang calls into a
+# fork and into two defs that call each other. Counts come from the argument
+# list, so no call is unrolled. Every line is the same at any thread count
+# and on either lane.
 import Base
 
 type Small is Data:
   Small{p: U32, q: U32, r: U32, s: U32, t: U32, u: U32}
+
+type Mode is Data:
+  Add{}
+  Mul{}
+  Xor{}
+
+type Two is Data:
+  Two{m: Mode, lo: Small, hi: Small}
 
 type Cfg is Data:
   Cfg{a: U32, b: U32, c: U32, d: U32, e: U32, f: U32, g: U32, h: U32, i: U32, j: U32, k: U32, m: U32, n: Nat}
@@ -212,6 +224,80 @@ def split(+z: Nat, +v: U32) -> U32:
   l r = pwalk(Nat.add(z, 5n), v, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13) pwalk(Nat.add(z, 4n), 1, v, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)
   U32.add(l, r)
 
+def two(t: Two, +x: U32) -> U32:
+  match t:
+    case Two{m, lo, hi}:
+      match m:
+        case Add{}:
+          U32.add(small(lo, x), small(hi, x))
+        case Mul{}:
+          U32.mul(small(lo, x), small(hi, x))
+        case Xor{}:
+          U32.xor(small(lo, x), small(hi, x))
+
+def deep(+d: Nat, +t: Two, +x: U32) -> U32:
+  match d:
+    case 0n:
+      two(t, x)
+    case 1n+e:
+      l r = deep(e, t, U32.add(x, 5)) deep(e, t, U32.mul(x, 7))
+      U32.add(l, r)
+
+def konst(+z: Nat) -> U32:
+  pwalk(Nat.add(z, 6n), 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 11, 12, 3)
+
+def cat(xs: List<Cfg>, ys: List<Cfg>) -> List<Cfg>:
+  match xs:
+    case Nil{}:
+      ys
+    case Con{h, t}:
+      h <> cat(t, ys)
+
+def keep(+d: Nat, +r: Cfg) -> List<Cfg>:
+  match d:
+    case 0n:
+      [r]
+    case 1n+e:
+      l s = keep(e, r) keep(e, r)
+      cat(l, s)
+
+def sumc(xs: List<Cfg>, +i: U32, +acc: U32) -> U32:
+  match xs:
+    case Nil{}:
+      acc
+    case Con{h, t}:
+      sumc(t, U32.add(i, 1), U32.add(acc, cfg(h, i)))
+
+def bump(r: Cfg) -> Cfg:
+  match r:
+    case Cfg{a, b, c, d, e, f, g, h, i, j, k, m, n}:
+      Cfg{b, U32.add(a, 1), c, d, e, f, g, h, i, j, k, m, n}
+
+def drift(+d: Nat, +r: Cfg, +x: U32) -> U32:
+  match d:
+    case 0n:
+      cfg(r, x)
+    case 1n+e:
+      l s = drift(e, r, U32.add(x, 1)) drift(e, bump(r), x)
+      U32.add(l, s)
+
+def fan(+d: Nat, +a0: U32, +a1: U32, +a2: U32, +a3: U32, +a4: U32,
+         +a5: U32, +a6: U32, +a7: U32, +x: U32) -> U32:
+  match d:
+    case 0n:
+      mix(x, U32.add(a0, a7), a4)
+    case 1n+e:
+      l s = pwalk(e, x, a6, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, a1) fan(e, a0, a1, a2, a3, a4, a5, a6, a7, U32.add(x, a2))
+      U32.add(l, s)
+
+def fans(+d: Nat, +x: U32) -> U32:
+  match d:
+    case 0n:
+      x
+    case 1n+e:
+      +l = fans(e, U32.add(x, 1))
+      U32.add(l, fan(3n, l, 2, 3, 4, 5, 6, 7, x, U32.mul(l, 3)))
+
 def mk(+x: U32, +n: Nat) -> Cfg:
   Cfg{x, U32.add(x, 1), U32.mul(x, 3), 4, 5, U32.xor(x, 6), 7, 8, U32.add(x, 9), 10, U32.mul(x, 11), 12, n}
 
@@ -227,6 +313,12 @@ def go(+z: Nat) -> IO(Unit):
     Unit <- IO.print(U32.show(clo(Nat.add(z, 7n), 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)))
     Unit <- IO.print(U32.show(app(mkf(Nat.add(z, 4n), 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12), 13)))
     Unit <- IO.print(U32.show(both(Nat.add(z, 7n), mk(5, 3n), 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)))
+    Unit <- IO.print(U32.show(deep(Nat.add(z, 7n), Two{Xor{}, Small{1, 2, 3, 4, 5, 6}, Small{7, 8, 9, 10, 11, 12}}, 3)))
+    Unit <- IO.print(U32.show(konst(z)))
+    Unit <- IO.print(U32.show(sumc(keep(Nat.add(z, 4n), mk(31, 6n)), 0, 0)))
+    Unit <- IO.print(U32.show(drift(Nat.add(z, 7n), mk(37, 7n), 8)))
+    Unit <- IO.print(U32.show(fan(Nat.add(z, 8n), 1, 2, 3, 4, 5, 6, 7, 8, 9)))
+    Unit <- IO.print(U32.show(fans(Nat.add(z, 9n), 7)))
     Unit <- IO.print(U32.show(vary(Nat.add(z, 8n), 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)))
     Unit <- IO.print(U32.show(tail(z, 31)))
     Unit <- IO.print(U32.show(split(z, 37)))
@@ -248,6 +340,12 @@ def main() -> IO(Unit):
 #|3352211648
 #|3273080320
 #|3825020032
+#|678986144
+#|3395558651
+#|3199838480
+#|2890378408
+#|2353742158
+#|1487899764
 #|1011159040
 #|594903963
 #|3449828574
