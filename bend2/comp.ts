@@ -2285,6 +2285,7 @@ function file_new(book: Bend.Book, js: boolean) {
     pincyc: new Map<Name, number>(),
     grps: new Map<Name, { gs: Slot[]; cls: number }>(),
     grpq: new Map<HTerm[], Of<"Var">>(),
+    grpw: new Set<string>(),
     cols: new Map<HTerm, Map<string, Cols>>(),
     etas: new Map<HTerm, [HTerm, HTerm | null][]>(),
     dst: false,
@@ -2794,6 +2795,7 @@ function bind_pop(sc: Scope, x: HTerm, at: Lay | null): Val {
   if (b.val.lay.grp) {
     // read before the binding goes: its node may go with it
     const v = val_hold(sc, grp_read(sc, b.val), p.k);
+    v.ws.forEach((w) => FL.grpw.add(w));
     bind_set(sc, p, b, b.n - 1);
     return v;
   }
@@ -3464,6 +3466,14 @@ function emit_spin(sc: Scope, ck: Spine): Val {
       - [...new Set([k, ...loop_of(k)])].reduce((n, d) =>
         n + (FL.sites.get(d + " " + k) ?? 0), 0) === 1
       && FL.pinof.has(tld_name(sc.seg.def)) ? "HOT " : "";
+    // a loop that takes words read off a group is told nothing of where
+    // they came from, so clang keeps them in place as it would parameters
+    // (quickhull's leaf loop ran 1.5% more instructions otherwise; a call
+    // that is not a loop keeps the reads where clang sinks them)
+    if (loop_of(k).length > 0) {
+      file_push(sc, ...xs.filter((w) => FL.grpw.has(w)).map((w) =>
+        `GRP_KEEP(${w});`));
+    }
     emit_lanes(sc, k, ws, ls, o);
     block(sc, `${hot}if (${name}(${["e", o, ...xs].join(", ")}) == 0) {`, () =>
       file_push(sc, "return 0;"));
@@ -5322,7 +5332,9 @@ function c_header(segs: Seg[], clos: string[]): string {
   `CONSTV Cid CID_T[] = { ${[...cids].map(([k, [n, d]]) => `{ ${[n,
     fact("ctr", k), d].map(Number).join(", ")} }`).join(", ")} };`,
   `#define STAT_LEN ${FL.img.length}`, `#define WL_RESW ${resw}`,
-  `#define BANGS ${FL.bangs.size}`, `#define WL_BANK Term ${ws.join(", ")};`,
+  `#define BANGS ${FL.bangs.size}`, ...FL.grps.size === 0 ? [] : ["#if DEVICE",
+    "#define GRP_KEEP(x)", "#else", '#define GRP_KEEP(x) __asm__("" : "+r"(x))',
+    "#endif"], `#define WL_BANK Term ${ws.join(", ")};`,
   "#define WL_LOAD(A, N) do { "
     + reg("if ((N) <= #) break; r# = e.mem[(A) + #];") + " } while (0);",
   `#define WL_LAST(X) switch (war) { ${reg("case #: r# = (X); break;")} }`,
