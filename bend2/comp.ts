@@ -16,7 +16,12 @@ import * as Bend from "./bend.ts";
 
 type Kind = "w32" | "w64" | "box";
 
-type Lay = { ks: Kind[]; arms: Record<Name, Lay[]> | null };
+type Lay = { ks: Kind[]; arms: Record<Name, Lay[]> | null; grp?: Grp;
+  free?: number };
+
+// A grouped parameter of a copy (grp_defs): no word of its own, its
+// words at off in the node that the binding ptr (GRP_PTR) holds.
+type Grp = { off: number; lay: Lay; ptr: Of<"Var"> };
 
 type Val = { ws: string[]; lay: Lay; stat: boolean; rs: (string | null)[];
   iv?: Iv };
@@ -155,12 +160,25 @@ const W32: Lay = { ks: ["w32"], arms: null };
 
 const BOX: Lay = { ks: ["box"], arms: null };
 
+const NONE: Lay = { ks: [], arms: null };
+
 const W64: Lay = { ks: ["w64"], arms: null };
 
 const WORDS: Record<string, Lay> = Object.setPrototypeOf(
   { U32: W32, F32: W32, Nat: W64 }, null);
 
 const WIDE = 247;
+
+// A group's node costs its reads a load on the way to their words: where
+// each call waits on the last (no fork inside the cycle), it pays from 20;
+// forked calls hide it, and there it pays from 8.
+const GRP_MIN = 20;
+
+const GRP_FORK = 8;
+
+const GRP_OWN = "~own";
+
+const GRP_PTR = "~grp";
 
 const ERRS = ("|*|*|out of memory: run again with a bigger span, as in"
   + " +RTS --gpu 8GB|a function the device does not hold|a Nat past the"
@@ -1154,6 +1172,253 @@ function brw_of(k: Name): boolean[] {
     && ty_adt(live[i][2])?.k !== "Array" && !fact("own", arg_key(k, i)));
 }
 
+// Parameters of words alone (no box: scalars, enums, records) that every
+// call inside a cycle of calls passes a parameter of the caller as it is
+// are a group, when the cycle has a call inside it that is not a tail (a
+// tail loop holds the words in place) and they hold GRP_FORK words or more
+// where the cycle forks inside, GRP_MIN where it does not. In d~grp, a copy
+// of each def of the cycle that holds the group, the first grouped
+// parameter takes a node of all their words (raw: no count, no borrow) and
+// the others no word, each reading its words off the node; the defs as
+// written take the words, and their first call into the cycle builds the
+// node (grp_args). Calls inside the cycle go to the copies (grp_route), so
+// frames, forks and tasks hold the group as one word.
+type GrpSite = { d: Name; tail: boolean; fork: boolean; from: number[] };
+
+type Slot = { i: number; off: number; lay: Lay };
+
+// The calls in k's body: the callee, whether in a tail or a fork, and per
+// argument the parameter of k it passes as it is (-1 for any other).
+function grp_sites(k: Name): GrpSite[] | null {
+  const f = fun_of(k);
+  const doms = tele_unbind(tld_of(k).T).doms.slice(0, f.n);
+  const live = doms.flatMap((d, j) => dom_live(d) ? [j] : []);
+  const tr = def_tree(k, doms.map(() => true));
+  if (tr.shape) {
+    return null;
+  }
+  const out: GrpSite[] = [];
+  const forks = new Set<HTerm>();
+  tr.leaves.forEach((pv, l) => term_any(l, (s, tail) => {
+    const m = term_spine(s);
+    if (s.$ === "Let" && s.k.length > 1) {
+      s.v.forEach((v) => forks.add(term_strip(v)));
+    }
+    if (s.$ === "App" && m.k !== null && m.k !== CLO_APPLY) {
+      out.push({ d: m.k, tail, fork: forks.has(s), from: m.xs.map((a) => {
+        const v = term_strip(a);
+        return v.$ === "Var" ? live.indexOf(pv.indexOf(v.i)) : -1;
+      }) });
+    }
+    return false;
+  }));
+  return out;
+}
+
+function grp_defs(): void {
+  const words = (k: Name, i: number): number => {
+    const l = fun_of(k).lays[i];
+    return l.ks.includes("box") ? 0 : l.ks.length;
+  };
+  const seen = new Set<Name>();
+  let id = 0;
+  for (const [k] of done_defs()) {
+    if (seen.has(k) || flat_of(k) || !def_reach_set(k).has(k)
+      || fun_of(k).lays.reduce((n, _, i) => n + words(k, i), 0) < GRP_FORK) {
+      continue;
+    }
+    const ds = new Set([k, ...[...def_reach_set(k)].filter((d) =>
+      def_reach_set(d).has(k))]);
+    ds.forEach((d) => seen.add(d));
+    const sites = new Map([...ds].map((d) => [d, grp_sites(d)]));
+    // a def that opens otherwise passes what no site shows
+    const gs = [...sites.values()].includes(null) ? null
+      : grp_slots(ds, sites as Map<Name, GrpSite[]>, words);
+    if (!gs) {
+      continue;
+    }
+    for (const d of ds) {
+      const f = fun_of(d), dg = d + "~grp", g = gs.slots.get(d);
+      FL.grpcyc.set(d, id).set(dg, id);
+      if (g) {
+        FL.grpof.set(d, dg);
+        FL.made[dg] = tld_of(d);
+        FL.srcs.set(dg, FL.srcs.get(d) ?? null);
+        FL.grps.set(dg, { gs: g, cls: gs.cls });
+        FL.funs.set(dg, { ...f, lays: f.lays.map((l, i) => {
+          const j = g.findIndex((x) => x.i === i);
+          return j === 0 ? W64 : j > 0 ? NONE : l;
+        }) });
+      }
+    }
+    id += 1;
+  }
+}
+
+// A cycle's slots: of the parameters with words, those every call inside
+// the cycle passes a parameter of the caller in the same slot, a slot being
+// the parameters such calls join. Each def holding any holds each slot once,
+// all the same slots, enough words in all; a slot has one offset in the
+// node, and a def's first grouped parameter takes the node.
+function grp_slots(ds: Set<Name>, sites: Map<Name, GrpSite[]>,
+  words: (d: Name, i: number) => number):
+  { slots: Map<Name, Slot[]>; cls: number } | null {
+  const inner = [...sites].flatMap(([a, ss]) =>
+    ss.filter((s) => ds.has(s.d)).map((s): [Name, GrpSite] => [a, s]));
+  if (inner.every(([, s]) => s.tail)) {
+    return null;
+  }
+  const gs = new Set<string>();
+  ds.forEach((d) => fun_of(d).lays.forEach((_, i) => words(d, i) > 0
+    && gs.add(arg_key(d, i))));
+  for (let cut = true; cut;) {
+    cut = false;
+    inner.forEach(([a, s]) => s.from.forEach((i, j) =>
+      gs.has(arg_key(s.d, j)) && !(i >= 0 && gs.has(arg_key(a, i)))
+      && (gs.delete(arg_key(s.d, j)), cut = true)));
+  }
+  const up = new Map<string, string>();
+  const root = (x: string): string => up.has(x) ? root(up.get(x)!) : x;
+  inner.forEach(([a, s]) => s.from.forEach((i, j) => {
+    const [x, y] = [root(arg_key(a, i)), root(arg_key(s.d, j))];
+    gs.has(arg_key(s.d, j)) && x !== y && up.set(x, y);
+  }));
+  const of = new Map<Name, Map<string, number>>();
+  for (const key of gs) {
+    const at = key.lastIndexOf("~");
+    const m = memo(of, key.slice(0, at), () => new Map<string, number>());
+    if (m.has(root(key))) {
+      return null;
+    }
+    m.set(root(key), Number(key.slice(at + 1)));
+  }
+  const [d0, m0] = [...of][0] ?? [];
+  const lay = (d: Name, r: string) => fun_of(d).lays[of.get(d)!.get(r)!];
+  if (!m0 || [...of].some(([d, m]) => m.size !== m0.size
+    || [...m0.keys()].some((r) => !m.has(r) || !lay_eq(lay(d, r), lay(d0, r))))) {
+    return null;
+  }
+  let n = 0;
+  const offs = new Map([...m0.keys()].map((r) =>
+    [r, (n += lay(d0, r).ks.length) - lay(d0, r).ks.length]));
+  if (n < (inner.some(([, s]) => s.fork) ? GRP_FORK : GRP_MIN)) {
+    return null;
+  }
+  return { cls: cls_fit(n), slots: new Map([...of].map(([d, m]) => [d,
+    [...m].map(([r, i]) => ({ i, off: offs.get(r)!, lay: lay(d, r) }))
+      .sort((x, y) => x.i - y.i)])) };
+}
+
+// A grouped parameter's words, read off its node.
+function grp_read(sc: Scope, v: Val): Val {
+  const { off, lay, ptr } = v.lay.grp!;
+  const nd = sc.uses.get(ptr)!.val.ws[0];
+  return val_new(lay.ks.map((kd, j) =>
+    `${kd === "w32" ? "(u32)" : ""}e.mem[${nd} + ${off + j}]`), lay);
+}
+
+// A copy's parameters as it holds them: the node's word in a binding of
+// its own; a body emitted in place reads off the binding that holds the
+// word already (an owner's, so the node lives while the body reads it).
+function grp_vals(sc: Scope, k: Name, vals: Val[]): Val[] {
+  const g = FL.grps.get(k);
+  if (!g) {
+    return vals;
+  }
+  const w = vals[g.gs[0].i].ws[0];
+  const ptr = [...sc.uses].find(([q, b]) => (q.k === GRP_PTR
+    || b.val.lay.free !== undefined) && b.val.ws[0] === w)?.[0]
+    ?? probe(GRP_PTR);
+  sc.uses.has(ptr) || sc.uses.set(ptr, { val: vals[g.gs[0].i], n: 1,
+    A: fun_of(k).live[g.gs[0].i][2] });
+  return vals.map((v, i) => {
+    const x = g.gs.find((y) => y.i === i);
+    return x ? val_new([], { ...NONE, grp: { off: x.off, lay: x.lay, ptr } })
+      : v;
+  });
+}
+
+// Whether a call hands a copy a node its caller owns (grp_args).
+function grp_owned(sc: Scope, ck: Spine): boolean {
+  const x = term_strip(ck.xs[FL.grps.get(ck.k!)!.gs[0].i]);
+  const ptr = sc.uses.get(probe_of(x))!.val.lay.grp!.ptr;
+  return sc.uses.get(ptr)?.val.lay.free !== undefined;
+}
+
+// Whether a call to a copy hands it its group's node: each grouped argument
+// a grouped parameter at the same offset.
+function grp_held(sc: Scope, ck: Spine): boolean {
+  return FL.grps.get(ck.k!)!.gs.every(({ i, off }) => {
+    const x = term_strip(ck.xs[i]);
+    return x.$ === "Var" && sc.uses.get(probe_of(x))?.val.lay.grp?.off === off;
+  });
+}
+
+// A call to a copy with a group passes the group's node on, or builds one
+// from its words, in a binding of its own (a node's owner): a variable used
+// again reads its words off the node from then on, and the owner frees the
+// node once no such variable lives (bind_set). The node a call passes is not
+// freed until its continuation; a tail call would leave it, so it is a cut.
+function grp_args(sc: Scope, ck: Spine, vs: (Val | null)[]): Map<number, Val> {
+  const { gs, cls } = FL.grps.get(ck.k!)!;
+  const xs = ck.xs.map(term_strip);
+  let nd: string;
+  if (grp_held(sc, ck)) {
+    nd = sc.uses.get(sc.uses.get(probe_of(xs[gs[0].i]))!.val.lay.grp!.ptr)!
+      .val.ws[0];
+    gs.forEach(({ i }) => {
+      const p = probe_of(xs[i]);
+      const b = sc.uses.get(p)!;
+      b.n > 1 ? sc.uses.set(p, { ...b, n: b.n - 1 }) : sc.uses.delete(p);
+    });
+  } else {
+    // one owner per call: a fork's join takes its tasks' bindings
+    const q = memo(FL.grpq, ck.xs, () => probe(GRP_OWN));
+    const ws = gs.map(({ i, off, lay }) => {
+      const p = xs[i].$ === "Var" ? probe_of(xs[i]) : null;
+      const b = p && sc.uses.get(p);
+      if (b && b.n > 1) {
+        const w = val_own(val_to(sc, b.val, lay));
+        sc.uses.set(p!, { ...b, n: b.n - 1, val: val_new([],
+          { ...NONE, grp: { off, lay, ptr: q } }) });
+        return w;
+      }
+      return val_own(val_to(sc, vs[i] ?? bind_pop(sc, xs[i], lay), lay));
+    });
+    nd = name_local(sc, "grp");
+    file_push(sc, `u64 ${nd} = heap_alloc(e, ${cls});`, ...gs.flatMap(
+      ({ off }, j) => ws[j].map((w, q) => `e.mem[${nd} + ${off + q}] = ${w};`)));
+    sc.uses.set(q, { val: val_new([nd], { ...W64, free: cls }), n: 1,
+      A: fun_of(ck.k!).live[gs[0].i][2] });
+  }
+  return new Map(gs.map(({ i }, j) =>
+    [i, val_new(j === 0 ? [nd] : [], j === 0 ? W64 : NONE)]));
+}
+
+// A call into a cycle with a group goes to the copies from inside the
+// cycle, or when it hands the copy its group's node; from outside it goes
+// to the def itself.
+function grp_route(sc: Scope, ck: Spine, inside = true): Spine {
+  const dg = ck.k === null || ck.b ? undefined : FL.grpof.get(ck.k);
+  return dg !== undefined && (inside && FL.grpcyc.get(sc.def)
+    === FL.grpcyc.get(ck.k) || grp_held(sc, { ...ck, k: dg }))
+    ? { ...ck, k: dg } : ck;
+}
+
+// The def a copy (d~grp) copies.
+function tld_name(k: Name): Name {
+  return k.endsWith("~grp") && FL.grpof.get(k.slice(0, -4)) === k
+    ? k.slice(0, -4) : k;
+}
+
+// Whether a call to a copy builds its group's node or, with lent, hands it
+// a node its caller owns: a tail call either way would leave the node, so
+// it is a cut, and the caller frees the node.
+function grp_fresh(sc: Scope, ck: Spine, lent = false): boolean {
+  return ck.k !== null && FL.grps.has(ck.k)
+    && (!grp_held(sc, ck) || lent && grp_owned(sc, ck));
+}
+
 // A slot parameter is a flat pair of an Array and a value: the array word is
 // the callee's, and the value's boxes are borrowed while the callee leaves
 // the array alone (arr_event).
@@ -1408,20 +1673,14 @@ function lt_any(t: any, p: (t: any) => boolean): boolean {
       && lt_any(x, p)));
 }
 
-function def_fix(k: Name): boolean {
-  const kf = k + "~fix";
-  const d = tld_of(k) as Bend.Def;
+// The leaves of k's body under its parameters' lambdas and matches, each
+// with its parameters' variables; fixed[j] holds while every self call
+// passes parameter j back as it is, calls holds the leaves that call k, and
+// bad counts a body that opens otherwise or names k unapplied.
+function def_tree(k: Name, fixed: boolean[]) {
   const f = fun_of(k);
-  if (k.endsWith("~fix") || tld_of(kf) || d.x) {
-    return false;
-  }
   const leaves = new Map<HTerm, number[]>();
-  const fixed = tele_unbind(d.T).doms.slice(0, f.n).map(([, , A]) => !(d.u
-    && (ty_holds(A, "Array")
-      || ty_holds(A, { tags: "ADT Typ Qua Min Eql", not: true }))));
   const calls = new Set<HTerm>();
-  const hits: [HTerm, HTerm, HTerm, string][] = [];
-  const longs = new Map<Name, boolean>();
   let bad = 0;
   const tree = (t: HTerm, left: number[], pv: number[]): void => {
     const s = Bend.term_strip(t);
@@ -1442,6 +1701,38 @@ function def_fix(k: Name): boolean {
     return s.$ === "App" && m.t.$ === "Ref" && m.t.k === k
       && m.all.length === f.n ? m : null;
   };
+  tree(f.h!, [...Array(f.n).keys()], Array(f.n).fill(-2));
+  const shape = bad;
+  for (const [l, pv] of leaves) {
+    term_any(l, (s) => {
+      const m = own(s);
+      bad += m ? 1 : s.$ === "Ref" && s.k === k ? -1 : 0;
+      m?.all.forEach((a, j) => {
+        const v = Bend.term_strip(a);
+        fixed[j] &&= v.$ === "Var" && v.i === pv[j];
+      });
+      m && calls.add(l);
+      return false;
+    });
+  }
+  return { leaves, calls, bad, own, shape };
+}
+
+function def_fix(k: Name): boolean {
+  const kf = k + "~fix";
+  const d = tld_of(k) as Bend.Def;
+  const f = fun_of(k);
+  if (k.endsWith("~fix") || tld_of(kf) || d.x) {
+    return false;
+  }
+  const fixed = tele_unbind(d.T).doms.slice(0, f.n).map(([, , A]) => !(d.u
+    && (ty_holds(A, "Array")
+      || ty_holds(A, { tags: "ADT Typ Qua Min Eql", not: true }))));
+  const hits: [HTerm, HTerm, HTerm, string][] = [];
+  const longs = new Map<Name, boolean>();
+  const tr = def_tree(k, fixed);
+  const { leaves, calls, own } = tr;
+  let { bad } = tr;
   const long = (g: Name): boolean => memo(longs, g, () => FL.srcs.has(g)
     && done_live(tld_of(g)) && !intr_of(g) && (!flat_of(g)
       || loop_of(g).length > 0 || [...FL.srcs.get(g)!].some(long)));
@@ -1472,19 +1763,6 @@ function def_fix(k: Name): boolean {
       hits.length = n;
     }
   };
-  tree(f.h!, [...Array(f.n).keys()], Array(f.n).fill(-2));
-  for (const [l, pv] of leaves) {
-    term_any(l, (s) => {
-      const m = own(s);
-      bad += m ? 1 : s.$ === "Ref" && s.k === k ? -1 : 0;
-      m?.all.forEach((a, j) => {
-        const v = Bend.term_strip(a);
-        fixed[j] &&= v.$ === "Var" && v.i === pv[j];
-      });
-      m && calls.add(l);
-      return false;
-    });
-  }
   leaves.forEach((pv, l) => bad || scan(l, null, l, pv));
   const hit = hits.find(([l]) => calls.has(l));
   if (bad || !hit) {
@@ -1931,6 +2209,12 @@ function file_new(book: Bend.Book, js: boolean) {
     effs: new Map<string, [string, string]>(),
     hold: new Map<string, boolean>(),
     cnts: new Map<Name, number[]>(),
+    reach: new Map<Name, Set<Name>>(),
+    grpof: new Map<Name, Name>(),
+    grpcyc: new Map<Name, number>(),
+    grps: new Map<Name, { gs: Slot[]; cls: number }>(),
+    grpq: new Map<HTerm[], Of<"Var">>(),
+    grpw: new Set<string>(),
     cols: new Map<HTerm, Map<string, Cols>>(),
     etas: new Map<HTerm, [HTerm, HTerm | null][]>(),
     dst: false,
@@ -2178,7 +2462,10 @@ function seg_open(sc: Scope, name: string, ret: Lay, frame: Seg["frame"],
   const seg = seg_new(name, ret, [...vals, res], frame);
   FL.unit!.segs.push(seg);
   sc = { ...sc, seg, spares: [], uses: new Map() };
-  live.forEach(([p, b], i) => bind_uses(sc, p, vals[i], rest, b.A));
+  // a node's owner after the variables that read off it (bind_set)
+  [...live.keys()].sort((i, j) => Number(live[i][1].val.lay.free !== undefined)
+    - Number(live[j][1].val.lay.free !== undefined)).forEach((i) =>
+    bind_uses(sc, live[i][0], vals[i], rest, live[i][1].A));
   return sc;
 }
 
@@ -2431,6 +2718,13 @@ function arr_leaf(sc: Scope, s: string, el: Lay): Val {
 function bind_pop(sc: Scope, x: HTerm, at: Lay | null): Val {
   const p = probe_of(x);
   const b = sc.uses.get(p)!;
+  if (b.val.lay.grp) {
+    // read before the binding goes: its node may go with it
+    const v = val_hold(sc, grp_read(sc, b.val), p.k);
+    v.ws.forEach((w) => FL.grpw.add(w));
+    bind_set(sc, p, b, b.n - 1);
+    return v;
+  }
   if (b.n <= 1) {
     sc.uses.delete(p);
     return b.val;
@@ -2465,8 +2759,25 @@ function bind_uses(sc: Scope, p: Of<"Var">, v: Val, rest: HTerm[],
 }
 
 function bind_set(sc: Scope, p: Of<"Var">, b: Bind, n: number): void {
-  if (n > 0) {
+  const grp = b.val.lay.grp?.ptr;
+  if (p.k === GRP_PTR) {
+    // the node's word, borrowed, lives on with the copy's body
+    sc.uses.set(p, { ...b, n: 1 });
+  } else if (n > 0) {
     sc.uses.set(p, { ...b, n });
+  } else if (b.val.lay.free !== undefined) {
+    // a node's owner lives while a variable reads off the node (a join run
+    // in sequence is handed 0 for a node only its tasks built)
+    if ([...sc.uses.values()].some((y) => y.val.lay.grp?.ptr === p)) {
+      sc.uses.set(p, { ...b, n: 1 });
+    } else {
+      sc.uses.delete(p);
+      file_push(sc, `spare_free(e, ${b.val.lay.free}, ${b.val.ws[0]});`);
+    }
+  } else if (grp) {
+    sc.uses.delete(p);
+    const o = sc.uses.get(grp);
+    o && o.val.lay.free !== undefined && bind_set(sc, grp, o, 0);
   } else {
     sc.uses.delete(p);
     val_sink(sc, b.val);
@@ -2861,18 +3172,25 @@ function emit_args(sc: Scope, ck: Spine, jump = false, fork = false,
   ck.all.forEach((a, q) =>
     fact("arg", arg_key(k, q)) && facts_hot(sc.def, a, true));
   const vars = xs.filter((x) => x.$ === "Var");
+  const g = FL.grps.get(k);
+  const at = (i: number) => g?.gs.find((y) => y.i === i)?.lay ?? lays[i];
   const vs = ck.xs.map((a, i) => xs[i].$ === "Var" ? null
     : emit_expr({ ...sc, rest: [...xs.slice(i + 1).filter((x) =>
-      x.$ !== "Var"), ...vars, ...sc.rest] }, a, null, lays[i]));
+      x.$ !== "Var"), ...vars, ...sc.rest] }, a, null, at(i)));
+  const gout = g ? grp_args(sc, ck, vs) : new Map<number, Val>();
   // A flat def that does not loop is lent an owned box its caller still
   // uses: the def keeps it where it owns it.
-  xs.forEach((x, i) => vs[i] ??= brw[i] || lend && (lend[i] = !!live[i]
+  xs.forEach((x, i) => gout.has(i) || (vs[i] ??= brw[i] || lend
+    && (lend[i] = !!live[i]
     && lays[i] === BOX && sc.uses.get(probe_of(x))!.val.lay === BOX
     && (ty_adt(live[i][2])?.k ?? "Array") !== "Array"
     && loop_of(k).length === 0 && rest_use(sc.rest, probe_of(x)) > 0
     && val_owned(sc.uses.get(probe_of(x))!.val).length > 0) ? null
-    : bind_pop(sc, x, lays[i]));
+    : bind_pop(sc, x, lays[i])));
   const out = xs.map((x, i) => {
+    if (gout.has(i)) {
+      return gout.get(i)!;
+    }
     const at = arg_key(k, i);
     let b = vs[i];
     if (b === null) {
@@ -3031,8 +3349,21 @@ function emit_spin(sc: Scope, ck: Spine): Val {
     const big = (d: Name): boolean => term_any(fun_of(d).h!, (y) =>
       ++n > HOT_SIZE || y.$ === "Ref" && y.k !== d && !intr_of(y.k)
         && flat_of(y.k) && big(y.k));
+    // a spin called once in the source (but from its own loop) is called
+    // from a def and its copy too (grp_defs); clang inlines one with one site
     const hot = loop_of(sc.def).length > 0 && loop_of(k).length === 0
-      && FL.sites.get(k)! > 1 && big(k) ? "HOT " : "";
+      && FL.sites.get(k)! > 1 && big(k) || FL.sites.get(k)!
+      - [...new Set([k, ...loop_of(k)])].reduce((n, d) =>
+        n + (FL.sites.get(d + " " + k) ?? 0), 0) === 1
+      && FL.grpof.has(tld_name(sc.seg.def)) ? "HOT " : "";
+    // a loop that takes words read off a group is told nothing of where
+    // they came from, so clang keeps them in place as it would parameters
+    // (quickhull's leaf loop ran 1.5% more instructions otherwise; a call
+    // that is not a loop keeps the reads where clang sinks them)
+    if (loop_of(k).length > 0) {
+      file_push(sc, ...xs.filter((w) => FL.grpw.has(w)).map((w) =>
+        `GRP_KEEP(${w});`));
+    }
     emit_lanes(sc, k, ws, ls, o);
     block(sc, `${hot}if (${name}(${["e", o, ...xs].join(", ")}) == 0) {`, () =>
       file_push(sc, "return 0;"));
@@ -3265,7 +3596,8 @@ function emit_open(k: Name, lend: boolean[] = []): [Scope, Val[]] {
   const { live, lays, ret } = fun_of(k);
   const vals = def_vals(k, lays.map((l, i) => l.ks.map(() =>
     name_local(sc, live[i]?.[1] ?? "k"))), lend);
-  return [{ ...sc, seg: seg_new(k, ret, vals), def: k }, vals];
+  return [{ ...sc, seg: seg_new(k, ret, vals), def: k },
+    grp_vals(sc, k, vals)];
 }
 
 // Def k's parameters over the words ws, as k holds them: a borrowed one is
@@ -3706,6 +4038,9 @@ function emit_intr(sc: Scope, k: Name, m: Spine, ty: HTerm | null): Val {
 }
 
 function emit_clo(sc: Scope, x: HTerm, ty: HTerm | null): Val {
+  // it may outlive a group's node: it takes the words
+  [...sc.uses].forEach(([p, b]) => b.val.lay.grp && rest_use([x], p) > 0
+    && sc.uses.set(p, { ...b, val: val_hold(sc, grp_read(sc, b.val), p.k) }));
   const live = [...sc.uses].filter(([p]) => rest_use([x], p) > 0);
   live.forEach(([p, b]) => {
     sc.uses.set(p, { ...b, n: b.n - rest_use([x], p) + 1 });
@@ -3823,12 +4158,27 @@ function def_reach(d: Name, k: Name, seen = new Set<Name>()): boolean {
     return d === k;
   }
   seen.add(d);
-  return [...memo(FL.calls, d, () => {
+  return [...def_calls(d)].some((c) => def_reach(c, k, seen));
+}
+
+// The defs d calls its way to.
+function def_reach_set(d: Name): Set<Name> {
+  return memo(FL.reach, d, () => {
+    const out = new Set<Name>();
+    const go = (x: Name): void => def_calls(x).forEach((c) =>
+      out.has(c) || (out.add(c), go(c)));
+    go(d);
+    return out;
+  });
+}
+
+function def_calls(d: Name): Set<Name> {
+  return memo(FL.calls, d, () => {
     const out = new Set<Name>();
     term_any(fun_of(d).h ?? DUMMY, (y) =>
       (y.$ === "Ref" && out.add(y.k), false));
     return out;
-  })].some((c) => def_reach(c, k, seen));
+  });
 }
 
 function emit_refold(sc: Scope, x: HTerm): HTerm {
@@ -4034,7 +4384,8 @@ function emit_body(sc: Scope, tm: HTerm, ty0: HTerm | null, args: Val[],
       const o = term_open(x);
       const at = lay_at(all.A, args[0]);
       const lay = lay_lazy(args[0], at) ? BOX : at;
-      const held = val_hold(sc, val_to(sc, args[0], lay), x.k);
+      const held = args[0].lay.grp ? args[0]
+        : val_hold(sc, val_to(sc, args[0], lay), x.k);
       ix_bind(sc, o.ps[0], held, args[0]);
       bind_uses(sc, o.ps[0], held, [o.b], all.A);
       return emit_body(sc, o.b, all.B(DUMMY), args.slice(1), dst);
@@ -4063,29 +4414,36 @@ function emit_body(sc: Scope, tm: HTerm, ty0: HTerm | null, args: Val[],
         return emit_body(sc, term_eta(x, ty!, 1), ty, args, dst);
       }
       sc = { ...sc, rest: [] };
-      const ck = term_spine(x);
-      if (ck.k === null) {
+      const c0 = term_spine(x);
+      if (c0.k === null) {
         return emit_put(sc, dst, emit_expr(sc, x, ty, dst?.lay ?? sc.seg.ret));
       }
-      if (sc.seg.lane === ck.k) {
-        const ws = emit_args(sc, ck, true).flatMap((v) => v.ws);
+      if (sc.seg.lane === c0.k) {
+        const ws = emit_args(sc, c0, true).flatMap((v) => v.ws);
         spare_flush(sc);
         return file_push(sc, ...ws.map((w, i) => `*lq${i} = ${w};`),
           "return 2;");
       }
-      const { h, ret } = fun_of(ck.k);
-      const once = FL.sites.get(ck.k) === 1 && !ck.b && !def_foreign(ck.tld)
+      const { h, ret } = fun_of(c0.k);
+      const once = FL.sites.get(c0.k) === 1 && !c0.b && !def_foreign(c0.tld)
         && (ret !== BOX || sc.seg.ret === BOX);
-      if (sc.seg.def !== ck.k && (flat_call(x) || (dst === null && once))) {
+      if (tld_name(sc.seg.def) !== c0.k
+        && (flat_call(x) || (dst === null && once))) {
+        // a body emitted in place is the copy's only if handed the boxes
+        const ck = grp_route(sc, c0, false);
         return flat_of(ck.k) && !(dst && loop_head(sc.seg.def)
           && loop_of(ck.k).includes(sc.seg.def))
           ? emit_put(sc, dst, inl_q(sc, ck) ? emit_inl(sc, ck)
             : emit_spin(sc, ck))
           : emit_body({ ...sc, def: ck.k }, h!, ck.tld!.T,
-            emit_args(sc, ck, true), dst);
+            grp_vals(sc, ck.k!, emit_args(sc, ck, true)), dst);
       }
-      if (!lay_eq(sc.seg.ret, ret)
-        && (sc.seg.ret.arms !== null || ret.arms !== null)) {
+      // a cut where the results' lays differ, or where a tail call would
+      // leave the callee a group's node (grp_fresh)
+      const ck = grp_route(sc, c0);
+      if ((!lay_eq(sc.seg.ret, ret)
+        && (sc.seg.ret.arms !== null || ret.arms !== null))
+        || (ty !== null && grp_fresh(sc, ck, true))) {
         return emit_body(sc, Bend.Let(["r"], [0], [Bend.Ann(x, ty!)],
           (xs) => xs[0]), ty, args, dst);
       }
@@ -4137,7 +4495,7 @@ function fork_lazy(k1: [Scope, Seg["frame"], [Of<"Var">, Bind][], Val, HTerm[]],
 
 function emit_fork(sc: Scope, x: Of<"Let">): void {
   const o = term_open(x);
-  const calls = x.v.map(term_spine);
+  const calls = x.v.map((v) => grp_route(sc, term_spine(v)));
   const fork = calls.length > 1;
   const name = seg_name("j");
   let hold = new Map<Of<"Var">, Bind>();
@@ -4149,8 +4507,9 @@ function emit_fork(sc: Scope, x: Of<"Let">): void {
       const margs = calls.map((c, j) => emit_args({ ...pl,
         rest: [...x.v.filter((_, i) => i !== j), o.b] }, c, false, true)
         .flatMap((v) => v.ws));
-      hold = new Map([...pl.uses].filter(([p, b]) =>
-        val_owned(b.val).length > 0 || rest_use([o.b], p) > 0));
+      hold = new Map([...pl.uses].filter(([p, b]) => p.k === GRP_OWN
+        || p.k === GRP_PTR || val_owned(b.val).length > 0
+        || rest_use([o.b], p) > 0));
       const caps = [...hold.values()].flatMap((b) => b.val.ws);
       const jn = emit_task(pl, seg_fid(name), calls.length, caps);
       const jt = `term_tsk(${seg_fid(name)}, ${jn})`;
@@ -4176,25 +4535,28 @@ function emit_fork(sc: Scope, x: Of<"Let">): void {
   // fork list; a hungry pool turns the oldest noted frame's second call into
   // a task (the s segment, on that frame) and the frame's continuation into
   // the w segment, which waits for the task's result.
-  const lazy = !FL.js && calls.length === 2 && !calls.some((c) => c.b);
+  const lazy = !FL.js && calls.length === 2 && !calls.some((c) => c.b
+    || grp_fresh(sc, c));
   const sname = lazy ? seg_name("s") : "";
   let k1: [Scope, Seg["frame"], [Of<"Var">, Bind][], Val, HTerm[]] | null = null;
   calls.forEach((c, i) => {
     if (lazy && i === 1) {
       file_push(sc, "WL_FKDROP");
     }
+    const before = new Set(sc.uses.keys());
     const cvs = emit_args({ ...sc, rest: [chain[i]] }, c, !!hole);
     const cargs = cvs.flatMap((v) => v.ws);
     const rr = ret_root(c.k!, cvs);
     const kn = seg_name("k");
     spare_flush(sc);
-    const ws = [...sc.uses].filter(([p]) => !i || p === o.ps[i - 1])
+    const ws = [...sc.uses].filter(([p]) => !i || p === o.ps[i - 1]
+      || p.k === GRP_OWN && !before.has(p))
       .flatMap(([p, b]) => (pos.set(p, depth), depth += b.val.ws.length,
         b.val.ws));
     const kf = seg_fid(kn);
     const on = `WL_SEQ(${sc.seg.fid})`;
     const base = !c.b && !hole && memo(FL.trees, c.k!, (k) =>
-      term_calls(fun_of(k).h ?? DUMMY, k) > 1);
+      term_calls(fun_of(k).h ?? DUMMY, tld_name(k)) > 1);
     if (lazy && i === 1) {
       fork_lazy(k1!, sname, c, chain[1], kf, ws.length, o.ps[0],
         ty_ann(x.v[0])!);
@@ -4245,7 +4607,8 @@ function emit_fork(sc: Scope, x: Of<"Let">): void {
 function ctr_hole(sc: Scope, c: Spine, b: HTerm, p: Of<"Var">):
   { at: string; cls: number } | null {
   const x = term_strip(b);
-  if (FL.js || x.$ !== "Ctr" || c.b || Object.hasOwn(OPTIMIZED.Array, x.k)
+  if (FL.js || x.$ !== "Ctr" || c.b || grp_fresh(sc, c)
+    || Object.hasOwn(OPTIMIZED.Array, x.k)
     || ret_at(c.k!) >= 0 || rest_use([b], p) !== 1 || sc.seg.ret !== BOX
     || fun_of(c.k!).ret !== BOX || sc.seg.lane) {
     return null;
@@ -4334,6 +4697,9 @@ function emit_match(sc: Scope, x: Of<"Mat"> | Of<"Efq">,
   if (x.$ === "Efq") {
     spare_flush(sc);
     return file_push(sc, "err_post(e.mem, ERR_TAGS);", "return 0;");
+  }
+  if (args[0]?.lay.grp) {
+    args = [grp_read(sc, args[0]), ...args.slice(1)];
   }
   const self = probe("s");
   const { adt, ret, rows, cells } = mat_rows(sc, x, ty, self);
@@ -4645,6 +5011,7 @@ function effect_src(k: Name, tld: Bend.Def & { i: string[] }): void {
 // WL_LOAD is a ladder: clang is O(n^2) on a fallthrough switch.
 
 function c_units(): Unit[] {
+  grp_defs();
   for (const [k, tld] of [...done_defs().reverse(),
     ...done_defs(def_foreign)]) {
     unit_new(k, () => {
@@ -4672,8 +5039,12 @@ function c_units(): Unit[] {
     was = FL.facts.size;
     FL.units.forEach(unit_emit);
     const us = [...FL.units.values()];
+    // a def and its copy (grp_defs) share their body, so a parameter one
+    // of them is lent is lent to both
     const lent = graph_close(new Set(us.flatMap((u) => [...u.lent])),
-      us.flatMap((u) => u.lends.map(([at, r]) => [r, at])));
+      [...us.flatMap((u) => u.lends.map(([at, r]) => [r, at])),
+        ...[...FL.grpof].flatMap(([d, dg]) => fun_of(d).lays.flatMap((_, i) =>
+          [[arg_key(d, i), arg_key(dg, i)], [arg_key(dg, i), arg_key(d, i)]]))]);
     for (const [k] of done_defs()) {
       brw_of(k).forEach((b, i) => b && !lent.has(arg_key(k, i))
         && fact_add("own", arg_key(k, i)));
@@ -4850,7 +5221,9 @@ function c_header(segs: Seg[], clos: string[]): string {
   `CONSTV Cid CID_T[] = { ${[...cids].map(([k, [n, d]]) => `{ ${[n,
     fact("ctr", k), d].map(Number).join(", ")} }`).join(", ")} };`,
   `#define STAT_LEN ${FL.img.length}`, `#define WL_RESW ${resw}`,
-  `#define BANGS ${FL.bangs.size}`, `#define WL_BANK Term ${ws.join(", ")};`,
+  `#define BANGS ${FL.bangs.size}`, ...FL.grps.size === 0 ? [] : ["#if DEVICE",
+    "#define GRP_KEEP(x)", "#else", '#define GRP_KEEP(x) __asm__("" : "+r"(x))',
+    "#endif"], `#define WL_BANK Term ${ws.join(", ")};`,
   "#define WL_LOAD(A, N) do { "
     + reg("if ((N) <= #) break; r# = e.mem[(A) + #];") + " } while (0);",
   `#define WL_LAST(X) switch (war) { ${reg("case #: r# = (X); break;")} }`,
