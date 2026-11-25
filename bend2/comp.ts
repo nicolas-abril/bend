@@ -162,6 +162,10 @@ const WORDS: Record<string, Lay> = Object.setPrototypeOf(
 
 const WIDE = 247;
 
+const PIN_MIN = 8;
+
+const PIN_VAR = "~pin";
+
 const ERRS = ("|*|*|out of memory: run again with a bigger span, as in"
   + " +RTS --gpu 8GB|a function the device does not hold|a Nat past the"
   + " largest immediate 2^48-1|*|memory fault (machine stack overflow?)|an"
@@ -1154,6 +1158,124 @@ function brw_of(k: Name): boolean[] {
     && ty_adt(live[i][2])?.k !== "Array" && !fact("own", arg_key(k, i)));
 }
 
+// A record parameter of PIN_MIN words or more, words alone, of a def that
+// is not flat, is a borrowed box when the def is in a cycle of calls whose
+// every call to it inside the cycle passes it such a parameter of the
+// caller: a call from outside boxes it once and drops it after (pin_box),
+// and the cycle's calls, frames and forks move one word; its reads peek the
+// node. A cycle pins if one of its calls inside it is not a tail (a tail
+// loop holds the words in place), or if it hands a pinned parameter on to
+// a cycle that pins. An own fact gives a parameter its words back.
+type PinSite = { d: Name; tail: boolean; from: number[] };
+
+// The calls in k's body: the callee, whether in a tail, and per argument
+// the parameter of k it passes as it is (-1 for any other).
+function pin_sites(k: Name): PinSite[] | null {
+  const f = fun_of(k);
+  const doms = tele_unbind(tld_of(k).T).doms.slice(0, f.n);
+  const live = doms.flatMap((d, j) => dom_live(d) ? [j] : []);
+  const tr = def_tree(k, doms.map(() => true));
+  if (tr.shape) {
+    return null;
+  }
+  const out: PinSite[] = [];
+  tr.leaves.forEach((pv, l) => term_any(l, (s, tail) => {
+    const m = term_spine(s);
+    if (s.$ === "App" && m.k !== null && m.k !== CLO_APPLY) {
+      out.push({ d: m.k, tail, from: m.xs.map((a) => {
+        const v = term_strip(a);
+        return v.$ === "Var" ? live.indexOf(pv.indexOf(v.i)) : -1;
+      }) });
+    }
+    return false;
+  }));
+  return out;
+}
+
+function pin_defs(): void {
+  const wide = (k: Name, i: number): boolean => {
+    const l = fun_of(k).lays[i];
+    if (l.ks.length < PIN_MIN || !l.arms || l.ks.includes("box")) {
+      return false;
+    }
+    const adt = ty_adt(fun_of(k).live[i][2])!;
+    const tld = tld_of(adt.k);
+    return tld?.$ === "ADT" && tld.c.length === 1 && !OWNED.includes(adt.k)
+      && !flat_of(k);
+  };
+  type Cycle = { ds: Set<Name>; ps: Set<string>; sites: Map<Name, PinSite[]>;
+    on: boolean };
+  const cycles: Cycle[] = [];
+  const seen = new Set<Name>();
+  for (const [k] of done_defs()) {
+    if (seen.has(k) || !fun_of(k).lays.some((_, i) => wide(k, i))
+      || !def_reach_set(k).has(k)) {
+      continue;
+    }
+    const ds = new Set([k, ...[...def_reach_set(k)].filter((d) =>
+      def_reach_set(d).has(k))]);
+    ds.forEach((d) => seen.add(d));
+    const sites = new Map([...ds].map((d) => [d, pin_sites(d)]));
+    // a def that opens otherwise passes what no site shows
+    if ([...sites.values()].includes(null)) {
+      continue;
+    }
+    const c: Cycle = { ds, ps: new Set(), on: false,
+      sites: sites as Map<Name, PinSite[]> };
+    ds.forEach((d) => fun_of(d).lays.forEach((_, i) => wide(d, i)
+      && c.ps.add(arg_key(d, i))));
+    // a call inside the cycle that passes anything else drops the parameter
+    for (let cut = true; cut;) {
+      cut = false;
+      c.sites.forEach((ss, a) => ss.forEach((s) => ds.has(s.d)
+        && s.from.forEach((i, j) => c.ps.has(arg_key(s.d, j))
+          && !(i >= 0 && c.ps.has(arg_key(a, i)))
+          && (c.ps.delete(arg_key(s.d, j)), cut = true))));
+    }
+    c.on = c.ps.size > 0 && [...c.sites.values()].some((ss) =>
+      ss.some((s) => ds.has(s.d) && !s.tail));
+    cycles.push(c);
+  }
+  const pinned = (key: string) => cycles.some((c) => c.on && c.ps.has(key));
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const c of cycles.filter((c) => !c.on && c.ps.size > 0)) {
+      if ([...c.sites].some(([a, ss]) => ss.some((s) => !c.ds.has(s.d)
+        && s.from.some((i, j) => i >= 0 && c.ps.has(arg_key(a, i))
+          && pinned(arg_key(s.d, j)))))) {
+        c.on = grew = true;
+      }
+    }
+  }
+  for (const c of cycles.filter((c) => c.on)) {
+    const all = [...c.ps].map((key): [Name, number, Lay] => {
+      const at = key.lastIndexOf("~");
+      const [k, i] = [key.slice(0, at), Number(key.slice(at + 1))];
+      return [k, i, fun_of(k).lays[i]];
+    });
+    all.forEach(([k, i]) => {
+      FL.pins.set(arg_key(k, i), all);
+      fun_of(k).lays[i] = BOX;
+    });
+  }
+}
+
+function pin_at(k: Name, i: number): boolean {
+  return FL.pins.size > 0 && FL.pins.has(arg_key(k, i))
+    && fun_of(k).lays[i] === BOX;
+}
+
+// Whether a call boxes a value for a pinned parameter (one not yet a box),
+// or, with lent, hands it a box its caller owns: a tail call either way
+// would leave the box to the callee, so it is a cut, and the caller drops it.
+function pin_fresh(sc: Scope, ck: Spine, lent = false): boolean {
+  return ck.k !== null && ck.xs.some((a, i) => {
+    const x = term_strip(a);
+    const v = x.$ === "Var" ? sc.uses.get(probe_of(x))?.val : undefined;
+    return pin_at(ck.k!, i) && (v?.lay !== BOX || lent && v.rs[0] === null);
+  });
+}
+
 // A slot parameter is a flat pair of an Array and a value: the array word is
 // the callee's, and the value's boxes are borrowed while the callee leaves
 // the array alone (arr_event).
@@ -1408,20 +1530,14 @@ function lt_any(t: any, p: (t: any) => boolean): boolean {
       && lt_any(x, p)));
 }
 
-function def_fix(k: Name): boolean {
-  const kf = k + "~fix";
-  const d = tld_of(k) as Bend.Def;
+// The leaves of k's body under its parameters' lambdas and matches, each
+// with its parameters' variables; fixed[j] holds while every self call
+// passes parameter j back as it is, calls holds the leaves that call k, and
+// bad counts a body that opens otherwise or names k unapplied.
+function def_tree(k: Name, fixed: boolean[]) {
   const f = fun_of(k);
-  if (k.endsWith("~fix") || tld_of(kf) || d.x) {
-    return false;
-  }
   const leaves = new Map<HTerm, number[]>();
-  const fixed = tele_unbind(d.T).doms.slice(0, f.n).map(([, , A]) => !(d.u
-    && (ty_holds(A, "Array")
-      || ty_holds(A, { tags: "ADT Typ Qua Min Eql", not: true }))));
   const calls = new Set<HTerm>();
-  const hits: [HTerm, HTerm, HTerm, string][] = [];
-  const longs = new Map<Name, boolean>();
   let bad = 0;
   const tree = (t: HTerm, left: number[], pv: number[]): void => {
     const s = Bend.term_strip(t);
@@ -1442,6 +1558,38 @@ function def_fix(k: Name): boolean {
     return s.$ === "App" && m.t.$ === "Ref" && m.t.k === k
       && m.all.length === f.n ? m : null;
   };
+  tree(f.h!, [...Array(f.n).keys()], Array(f.n).fill(-2));
+  const shape = bad;
+  for (const [l, pv] of leaves) {
+    term_any(l, (s) => {
+      const m = own(s);
+      bad += m ? 1 : s.$ === "Ref" && s.k === k ? -1 : 0;
+      m?.all.forEach((a, j) => {
+        const v = Bend.term_strip(a);
+        fixed[j] &&= v.$ === "Var" && v.i === pv[j];
+      });
+      m && calls.add(l);
+      return false;
+    });
+  }
+  return { leaves, calls, bad, own, fixed, shape };
+}
+
+function def_fix(k: Name): boolean {
+  const kf = k + "~fix";
+  const d = tld_of(k) as Bend.Def;
+  const f = fun_of(k);
+  if (k.endsWith("~fix") || tld_of(kf) || d.x) {
+    return false;
+  }
+  const fixed = tele_unbind(d.T).doms.slice(0, f.n).map(([, , A]) => !(d.u
+    && (ty_holds(A, "Array")
+      || ty_holds(A, { tags: "ADT Typ Qua Min Eql", not: true }))));
+  const hits: [HTerm, HTerm, HTerm, string][] = [];
+  const longs = new Map<Name, boolean>();
+  const tr = def_tree(k, fixed);
+  const { leaves, calls, own } = tr;
+  let { bad } = tr;
   const long = (g: Name): boolean => memo(longs, g, () => FL.srcs.has(g)
     && done_live(tld_of(g)) && !intr_of(g) && (!flat_of(g)
       || loop_of(g).length > 0 || [...FL.srcs.get(g)!].some(long)));
@@ -1472,19 +1620,6 @@ function def_fix(k: Name): boolean {
       hits.length = n;
     }
   };
-  tree(f.h!, [...Array(f.n).keys()], Array(f.n).fill(-2));
-  for (const [l, pv] of leaves) {
-    term_any(l, (s) => {
-      const m = own(s);
-      bad += m ? 1 : s.$ === "Ref" && s.k === k ? -1 : 0;
-      m?.all.forEach((a, j) => {
-        const v = Bend.term_strip(a);
-        fixed[j] &&= v.$ === "Var" && v.i === pv[j];
-      });
-      m && calls.add(l);
-      return false;
-    });
-  }
   leaves.forEach((pv, l) => bad || scan(l, null, l, pv));
   const hit = hits.find(([l]) => calls.has(l));
   if (bad || !hit) {
@@ -1931,6 +2066,8 @@ function file_new(book: Bend.Book, js: boolean) {
     effs: new Map<string, [string, string]>(),
     hold: new Map<string, boolean>(),
     cnts: new Map<Name, number[]>(),
+    pins: new Map<string, [Name, number, Lay][]>(),
+    reach: new Map<Name, Set<Name>>(),
     cols: new Map<HTerm, Map<string, Cols>>(),
     etas: new Map<HTerm, [HTerm, HTerm | null][]>(),
     dst: false,
@@ -2023,6 +2160,9 @@ function fact_add(kind: string, k = ""): boolean {
     return false;
   }
   FL.facts.add(key);
+  // the cycle of an owned pinned parameter takes its words back
+  (kind === "own" ? FL.pins.get(k) : undefined)?.forEach(([d, i, l]) =>
+    fun_of(d).lays[i] = l);
   FL.when.get(key)?.splice(0).forEach((f) => f());
   return true;
 }
@@ -2864,6 +3004,13 @@ function emit_args(sc: Scope, ck: Spine, jump = false, fork = false,
   const vs = ck.xs.map((a, i) => xs[i].$ === "Var" ? null
     : emit_expr({ ...sc, rest: [...xs.slice(i + 1).filter((x) =>
       x.$ !== "Var"), ...vars, ...sc.rest] }, a, null, lays[i]));
+  xs.forEach((x, i) => {
+    if (pin_at(k, i)) {
+      xs[i] = pin_box(sc, x, vs[i], live[i][2]);
+      vs[i] = null;
+      jump || FL.unit!.lent.add(arg_key(k, i));
+    }
+  });
   // A flat def that does not loop is lent an owned box its caller still
   // uses: the def keeps it where it owns it.
   xs.forEach((x, i) => vs[i] ??= brw[i] || lend && (lend[i] = !!live[i]
@@ -2936,6 +3083,24 @@ function emit_args(sc: Scope, ck: Spine, jump = false, fork = false,
     return val_new(v.ws, v.lay, v.lay.ks.map((_, j) =>
       j === 0 && slot[i] ? null : at));
   });
+}
+
+// The variable a pinned parameter is lent: x if its binding is a box or is
+// used again (it becomes a box, so its frames hold one word), else a new
+// binding of the boxed value, which the caller's next frame keeps and its
+// continuation drops (a tail call that needs one is a cut).
+function pin_box(sc: Scope, x: HTerm, v: Val | null, A: HTerm): HTerm {
+  const p = x.$ === "Var" ? probe_of(x) : null;
+  const b = p && sc.uses.get(p);
+  const box = (u: Val) => val_hold(sc, val_to(sc, u, BOX), "pin");
+  if (b && (b.val.lay === BOX || b.n > 1)) {
+    sc.uses.set(p!, { ...b, val: box(b.val) });
+    return x;
+  }
+  const q = probe(PIN_VAR);
+  sc.uses.set(q, { val: box(v ?? bind_pop(sc, x, BOX)), n: 1,
+    A: b ? b.A : A });
+  return q;
 }
 
 // A flat def that takes a value read from an Array, and calls itself
@@ -3823,12 +3988,27 @@ function def_reach(d: Name, k: Name, seen = new Set<Name>()): boolean {
     return d === k;
   }
   seen.add(d);
-  return [...memo(FL.calls, d, () => {
+  return [...def_calls(d)].some((c) => def_reach(c, k, seen));
+}
+
+// The defs d calls its way to.
+function def_reach_set(d: Name): Set<Name> {
+  return memo(FL.reach, d, () => {
+    const out = new Set<Name>();
+    const go = (x: Name): void => def_calls(x).forEach((c) =>
+      out.has(c) || (out.add(c), go(c)));
+    go(d);
+    return out;
+  });
+}
+
+function def_calls(d: Name): Set<Name> {
+  return memo(FL.calls, d, () => {
     const out = new Set<Name>();
     term_any(fun_of(d).h ?? DUMMY, (y) =>
       (y.$ === "Ref" && out.add(y.k), false));
     return out;
-  })].some((c) => def_reach(c, k, seen));
+  });
 }
 
 function emit_refold(sc: Scope, x: HTerm): HTerm {
@@ -4089,6 +4269,10 @@ function emit_body(sc: Scope, tm: HTerm, ty0: HTerm | null, args: Val[],
         return emit_body(sc, Bend.Let(["r"], [0], [Bend.Ann(x, ty!)],
           (xs) => xs[0]), ty, args, dst);
       }
+      if (ty && pin_fresh(sc, ck, true)) {
+        return emit_body(sc, Bend.Let(["r"], [0], [Bend.Ann(x, ty)],
+          (xs) => xs[0]), ty, args, dst);
+      }
       const vals = emit_args(sc, ck, true);
       if (FL.ix && sc.seg.native && sc.seg.def === ck.k) {
         ix_forms(sc, ck, vals);
@@ -4176,7 +4360,8 @@ function emit_fork(sc: Scope, x: Of<"Let">): void {
   // fork list; a hungry pool turns the oldest noted frame's second call into
   // a task (the s segment, on that frame) and the frame's continuation into
   // the w segment, which waits for the task's result.
-  const lazy = !FL.js && calls.length === 2 && !calls.some((c) => c.b);
+  const lazy = !FL.js && calls.length === 2 && !calls.some((c) => c.b
+    || pin_fresh(sc, c));
   const sname = lazy ? seg_name("s") : "";
   let k1: [Scope, Seg["frame"], [Of<"Var">, Bind][], Val, HTerm[]] | null = null;
   calls.forEach((c, i) => {
@@ -4188,7 +4373,8 @@ function emit_fork(sc: Scope, x: Of<"Let">): void {
     const rr = ret_root(c.k!, cvs);
     const kn = seg_name("k");
     spare_flush(sc);
-    const ws = [...sc.uses].filter(([p]) => !i || p === o.ps[i - 1])
+    const ws = [...sc.uses].filter(([p]) => !i || p === o.ps[i - 1]
+      || p.k === PIN_VAR)
       .flatMap(([p, b]) => (pos.set(p, depth), depth += b.val.ws.length,
         b.val.ws));
     const kf = seg_fid(kn);
@@ -4245,7 +4431,8 @@ function emit_fork(sc: Scope, x: Of<"Let">): void {
 function ctr_hole(sc: Scope, c: Spine, b: HTerm, p: Of<"Var">):
   { at: string; cls: number } | null {
   const x = term_strip(b);
-  if (FL.js || x.$ !== "Ctr" || c.b || Object.hasOwn(OPTIMIZED.Array, x.k)
+  if (FL.js || x.$ !== "Ctr" || c.b || pin_fresh(sc, c)
+    || Object.hasOwn(OPTIMIZED.Array, x.k)
     || ret_at(c.k!) >= 0 || rest_use([b], p) !== 1 || sc.seg.ret !== BOX
     || fun_of(c.k!).ret !== BOX || sc.seg.lane) {
     return null;
@@ -4645,6 +4832,7 @@ function effect_src(k: Name, tld: Bend.Def & { i: string[] }): void {
 // WL_LOAD is a ladder: clang is O(n^2) on a fallthrough switch.
 
 function c_units(): Unit[] {
+  pin_defs();
   for (const [k, tld] of [...done_defs().reverse(),
     ...done_defs(def_foreign)]) {
     unit_new(k, () => {
