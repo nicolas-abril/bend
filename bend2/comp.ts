@@ -172,8 +172,11 @@ const WIDE = 247;
 const PIN_MIN = 12;
 
 // A group's node costs its reads a load on the way to their words: where
-// each call waits on the last (no fork inside the cycle), it pays from 20.
+// each call waits on the last (no fork inside the cycle), it pays from 20;
+// forked calls hide it, and there it pays from 8.
 const GRP_MIN = 20;
+
+const GRP_FORK = 8;
 
 const PIN_VAR = "~pin";
 
@@ -1175,7 +1178,7 @@ function brw_of(k: Name): boolean[] {
 // is not flat, is a borrowed box in d~pin, a copy of the def, when the def
 // is in a cycle of calls whose every call to it inside the cycle passes it
 // such a parameter of the caller. Other parameters of words alone that the
-// cycle passes so, PIN_MIN words or more in all, are a group (pin_grp): in
+// cycle passes so, enough words in all, are a group (pin_grp): in
 // the copy one of them takes a node of all their words, the others no word. A call from outside hands its words to
 // the def itself, whose first call into the cycle boxes them (pin_box) and
 // drops the box after; inside, the copies' calls, frames and forks move one
@@ -1238,7 +1241,7 @@ function pin_defs(): void {
   for (const [k] of done_defs()) {
     if (seen.has(k) || flat_of(k) || !(fun_of(k).lays.some((_, i) =>
       wide(k, i)) || fun_of(k).lays.reduce((n, _, i) => n + words(k, i), 0)
-      >= PIN_MIN) || !def_reach_set(k).has(k)) {
+      >= GRP_FORK) || !def_reach_set(k).has(k)) {
       continue;
     }
     const ds = new Set([k, ...[...def_reach_set(k)].filter((d) =>
@@ -1308,8 +1311,8 @@ function pin_defs(): void {
 // A cycle's group: the parameters that pass (ok) and that every call inside
 // the cycle passes a parameter of the caller in the same slot, a slot being
 // the parameters such calls join. Each def holding any holds each slot once,
-// all the same slots, PIN_MIN words or more (GRP_MIN in a cycle that does
-// not fork inside); a slot has one offset in the node, and a def's first
+// all the same slots, GRP_FORK words or more where the cycle forks inside
+// (GRP_MIN where it does not); a slot has one offset in the node, and a def's first
 // grouped parameter takes the node.
 function pin_grp(c: Cycle, ok: (d: Name, i: number) => boolean): void {
   const gs = new Set<string>();
@@ -1349,7 +1352,7 @@ function pin_grp(c: Cycle, ok: (d: Name, i: number) => boolean): void {
     [r, (n += lay(d0, r).ks.length) - lay(d0, r).ks.length]));
   const fork = [...c.sites.values()].some((ss) =>
     ss.some((s) => c.ds.has(s.d) && s.fork));
-  if (n >= (fork ? PIN_MIN : GRP_MIN)) {
+  if (n >= (fork ? GRP_FORK : GRP_MIN)) {
     c.cls = cls_fit(n);
     c.gs = new Map([...of].map(([d, m]) => [d, [...m].map(([r, i]) =>
       ({ i, off: offs.get(r)!, lay: lay(d, r) })).sort((x, y) => x.i - y.i)]));
