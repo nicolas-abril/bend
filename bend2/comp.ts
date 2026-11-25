@@ -1381,6 +1381,13 @@ function grp_vals(sc: Scope, k: Name, vals: Val[]): Val[] {
   });
 }
 
+// Whether a call hands a copy a node its caller owns (grp_args).
+function grp_owned(sc: Scope, ck: Spine): boolean {
+  const x = term_strip(ck.xs[FL.grps.get(ck.k!)!.gs[0].i]);
+  const ptr = sc.uses.get(probe_of(x))!.val.lay.grp!.ptr;
+  return sc.uses.get(ptr)?.val.lay.free !== undefined;
+}
+
 // Whether a call to a copy hands it its group's node: each grouped argument
 // a grouped parameter at the same offset.
 function grp_held(sc: Scope, ck: Spine): boolean {
@@ -1391,8 +1398,10 @@ function grp_held(sc: Scope, ck: Spine): boolean {
 }
 
 // A call to a copy with a group passes the group's node on, or builds one
-// from its words: a binding of its own, which the caller's next frame keeps
-// and its continuation frees (a tail call that builds one is a cut).
+// from its words, in a binding of its own (a node's owner): a variable used
+// again reads its words off the node from then on, and the owner frees the
+// node once no such variable lives (bind_set). The node a call passes is not
+// freed until its continuation; a tail call would leave it, so it is a cut.
 function grp_args(sc: Scope, ck: Spine, vs: (Val | null)[]): Map<number, Val> {
   const { gs, cls } = FL.grps.get(ck.k!)!;
   const xs = ck.xs.map(term_strip);
@@ -1402,16 +1411,28 @@ function grp_args(sc: Scope, ck: Spine, vs: (Val | null)[]): Map<number, Val> {
       .val.ws[0];
     gs.forEach(({ i }) => {
       const p = probe_of(xs[i]);
-      bind_set(sc, p, sc.uses.get(p)!, sc.uses.get(p)!.n - 1);
+      const b = sc.uses.get(p)!;
+      b.n > 1 ? sc.uses.set(p, { ...b, n: b.n - 1 }) : sc.uses.delete(p);
     });
   } else {
-    const ws = gs.map(({ i, lay }) =>
-      val_own(val_to(sc, vs[i] ?? bind_pop(sc, xs[i], lay), lay)));
+    // one owner per call: a fork's join takes its tasks' bindings
+    const q = memo(FL.grpq, ck.xs, () => probe(PIN_VAR));
+    const ws = gs.map(({ i, off, lay }) => {
+      const p = xs[i].$ === "Var" ? probe_of(xs[i]) : null;
+      const b = p && sc.uses.get(p);
+      if (b && b.n > 1) {
+        const w = val_own(val_to(sc, b.val, lay));
+        sc.uses.set(p!, { ...b, n: b.n - 1, val: val_new([],
+          { ...NONE, grp: { off, lay, ptr: q } }) });
+        return w;
+      }
+      return val_own(val_to(sc, vs[i] ?? bind_pop(sc, xs[i], lay), lay));
+    });
     nd = name_local(sc, "grp");
     file_push(sc, `u64 ${nd} = heap_alloc(e, ${cls});`, ...gs.flatMap(
       ({ off }, j) => ws[j].map((w, q) => `e.mem[${nd} + ${off + q}] = ${w};`)));
-    sc.uses.set(probe(PIN_VAR), { val: val_new([nd], { ...W64, free: cls }),
-      n: 1, A: fun_of(ck.k!).live[gs[0].i][2] });
+    sc.uses.set(q, { val: val_new([nd], { ...W64, free: cls }), n: 1,
+      A: fun_of(ck.k!).live[gs[0].i][2] });
   }
   return new Map(gs.map(({ i }, j) =>
     [i, val_new(j === 0 ? [nd] : [], j === 0 ? W64 : NONE)]));
@@ -1451,7 +1472,8 @@ function pin_at(k: Name, i: number): boolean {
 // or, with lent, hands it a box its caller owns: a tail call either way
 // would leave the box to the callee, so it is a cut, and the caller drops it.
 function pin_fresh(sc: Scope, ck: Spine, lent = false): boolean {
-  return ck.k !== null && (FL.grps.has(ck.k) && !grp_held(sc, ck)
+  return ck.k !== null && (FL.grps.has(ck.k)
+    && (!grp_held(sc, ck) || lent && grp_owned(sc, ck))
     || ck.xs.some((a, i) => {
     const x = term_strip(a);
     const v = x.$ === "Var" ? sc.uses.get(probe_of(x))?.val : undefined;
@@ -2255,6 +2277,7 @@ function file_new(book: Bend.Book, js: boolean) {
     pinof: new Map<Name, Name>(),
     pincyc: new Map<Name, number>(),
     grps: new Map<Name, { gs: Slot[]; cls: number }>(),
+    grpq: new Map<HTerm[], Of<"Var">>(),
     cols: new Map<HTerm, Map<string, Cols>>(),
     etas: new Map<HTerm, [HTerm, HTerm | null][]>(),
     dst: false,
@@ -2505,7 +2528,10 @@ function seg_open(sc: Scope, name: string, ret: Lay, frame: Seg["frame"],
   const seg = seg_new(name, ret, [...vals, res], frame);
   FL.unit!.segs.push(seg);
   sc = { ...sc, seg, spares: [], uses: new Map() };
-  live.forEach(([p, b], i) => bind_uses(sc, p, vals[i], rest, b.A));
+  // a node's owner after the variables that read off it (bind_set)
+  [...live.keys()].sort((i, j) => Number(live[i][1].val.lay.free !== undefined)
+    - Number(live[j][1].val.lay.free !== undefined)).forEach((i) =>
+    bind_uses(sc, live[i][0], vals[i], rest, live[i][1].A));
   return sc;
 }
 
@@ -2759,7 +2785,8 @@ function bind_pop(sc: Scope, x: HTerm, at: Lay | null): Val {
   const p = probe_of(x);
   const b = sc.uses.get(p)!;
   if (b.val.lay.grp) {
-    const v = grp_read(sc, b.val);
+    // read before the binding goes: its node may go with it
+    const v = val_hold(sc, grp_read(sc, b.val), p.k);
     bind_set(sc, p, b, b.n - 1);
     return v;
   }
@@ -2802,15 +2829,25 @@ function bind_uses(sc: Scope, p: Of<"Var">, v: Val, rest: HTerm[],
 function bind_set(sc: Scope, p: Of<"Var">, b: Bind, n: number): void {
   const adt = val_owned(b.val).length > 0 && b.val.lay === BOX
     ? ty_adt(b.A) : null;
+  const grp = b.val.lay.grp?.ptr;
   if (p.k === GRP_PTR) {
     // the node's word, borrowed, lives on with the copy's body
     sc.uses.set(p, { ...b, n: 1 });
   } else if (n > 0) {
     sc.uses.set(p, { ...b, n });
   } else if (b.val.lay.free !== undefined) {
-    // (a join run in sequence is handed 0 for a node only its tasks built)
+    // a node's owner lives while a variable reads off the node (a join run
+    // in sequence is handed 0 for a node only its tasks built)
+    if ([...sc.uses.values()].some((y) => y.val.lay.grp?.ptr === p)) {
+      sc.uses.set(p, { ...b, n: 1 });
+    } else {
+      sc.uses.delete(p);
+      file_push(sc, `spare_free(e, ${b.val.lay.free}, ${b.val.ws[0]});`);
+    }
+  } else if (grp) {
     sc.uses.delete(p);
-    file_push(sc, `spare_free(e, ${b.val.lay.free}, ${b.val.ws[0]});`);
+    const o = sc.uses.get(grp);
+    o && o.val.lay.free !== undefined && bind_set(sc, grp, o, 0);
   } else if (adt && FL.pinty.has(adt.k)) {
     sc.uses.delete(p);
     const k = (tld_of(adt.k) as Bend.ADT).c[0].k, w = b.val.ws[0];
@@ -4594,13 +4631,14 @@ function emit_fork(sc: Scope, x: Of<"Let">): void {
     if (lazy && i === 1) {
       file_push(sc, "WL_FKDROP");
     }
+    const before = new Set(sc.uses.keys());
     const cvs = emit_args({ ...sc, rest: [chain[i]] }, c, !!hole);
     const cargs = cvs.flatMap((v) => v.ws);
     const rr = ret_root(c.k!, cvs);
     const kn = seg_name("k");
     spare_flush(sc);
     const ws = [...sc.uses].filter(([p]) => !i || p === o.ps[i - 1]
-      || p.k === PIN_VAR)
+      || p.k === PIN_VAR && !before.has(p))
       .flatMap(([p, b]) => (pos.set(p, depth), depth += b.val.ws.length,
         b.val.ws));
     const kf = seg_fid(kn);
