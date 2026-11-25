@@ -1368,14 +1368,18 @@ function grp_read(sc: Scope, v: Val): Val {
 }
 
 // A copy's parameters as it holds them: the node's word in a binding of
-// its own, which lives while a grouped parameter does.
+// its own; a body emitted in place reads off the binding that holds the
+// word already (an owner's, so the node lives while the body reads it).
 function grp_vals(sc: Scope, k: Name, vals: Val[]): Val[] {
   const g = FL.grps.get(k);
   if (!g) {
     return vals;
   }
-  const ptr = probe(GRP_PTR);
-  sc.uses.set(ptr, { val: vals[g.gs[0].i], n: 1,
+  const w = vals[g.gs[0].i].ws[0];
+  const ptr = [...sc.uses].find(([q, b]) => (q.k === GRP_PTR
+    || b.val.lay.free !== undefined) && b.val.ws[0] === w)?.[0]
+    ?? probe(GRP_PTR);
+  sc.uses.has(ptr) || sc.uses.set(ptr, { val: vals[g.gs[0].i], n: 1,
     A: fun_of(k).live[g.gs[0].i][2] });
   return vals.map((v, i) => {
     const x = g.gs.find((y) => y.i === i);
@@ -3453,8 +3457,13 @@ function emit_spin(sc: Scope, ck: Spine): Val {
     const big = (d: Name): boolean => term_any(fun_of(d).h!, (y) =>
       ++n > HOT_SIZE || y.$ === "Ref" && y.k !== d && !intr_of(y.k)
         && flat_of(y.k) && big(y.k));
+    // a spin called once in the source (but from its own loop) is called
+    // from a def and its pinned copy too; clang inlines one with one site
     const hot = loop_of(sc.def).length > 0 && loop_of(k).length === 0
-      && FL.sites.get(k)! > 1 && big(k) ? "HOT " : "";
+      && FL.sites.get(k)! > 1 && big(k) || FL.sites.get(k)!
+      - [...new Set([k, ...loop_of(k)])].reduce((n, d) =>
+        n + (FL.sites.get(d + " " + k) ?? 0), 0) === 1
+      && FL.pinof.has(tld_name(sc.seg.def)) ? "HOT " : "";
     emit_lanes(sc, k, ws, ls, o);
     block(sc, `${hot}if (${name}(${["e", o, ...xs].join(", ")}) == 0) {`, () =>
       file_push(sc, "return 0;"));
