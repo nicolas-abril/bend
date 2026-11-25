@@ -1269,10 +1269,10 @@ function pin_defs(): void {
 
 // A call into a pinned cycle goes to the copies from inside the cycle, or
 // when it holds the boxes already; from outside it goes to the def itself.
-function pin_route(sc: Scope, ck: Spine): Spine {
+function pin_route(sc: Scope, ck: Spine, inside = true): Spine {
   const dp = ck.k === null || ck.b ? undefined : FL.pinof.get(ck.k);
   return dp !== undefined && pin_live(dp)
-    && (FL.pincyc.get(sc.def) === FL.pincyc.get(ck.k)
+    && (inside && FL.pincyc.get(sc.def) === FL.pincyc.get(ck.k)
     || ck.xs.every((a, i) => {
       const x = term_strip(a);
       return !FL.pins.has(arg_key(dp, i)) || x.$ === "Var"
@@ -4288,20 +4288,23 @@ function emit_body(sc: Scope, tm: HTerm, ty0: HTerm | null, args: Val[],
         return emit_body(sc, term_eta(x, ty!, 1), ty, args, dst);
       }
       sc = { ...sc, rest: [] };
-      const ck = pin_route(sc, term_spine(x));
-      if (ck.k === null) {
+      const c0 = term_spine(x);
+      if (c0.k === null) {
         return emit_put(sc, dst, emit_expr(sc, x, ty, dst?.lay ?? sc.seg.ret));
       }
-      if (sc.seg.lane === ck.k) {
-        const ws = emit_args(sc, ck, true).flatMap((v) => v.ws);
+      if (sc.seg.lane === c0.k) {
+        const ws = emit_args(sc, c0, true).flatMap((v) => v.ws);
         spare_flush(sc);
         return file_push(sc, ...ws.map((w, i) => `*lq${i} = ${w};`),
           "return 2;");
       }
-      const { h, ret } = fun_of(ck.k);
-      const once = FL.sites.get(ck.k) === 1 && !ck.b && !def_foreign(ck.tld)
+      const { h, ret } = fun_of(c0.k);
+      const once = FL.sites.get(c0.k) === 1 && !c0.b && !def_foreign(c0.tld)
         && (ret !== BOX || sc.seg.ret === BOX);
-      if (sc.seg.def !== ck.k && (flat_call(x) || (dst === null && once))) {
+      if (tld_name(sc.seg.def) !== c0.k
+        && (flat_call(x) || (dst === null && once))) {
+        // a body emitted in place is the copy's only if handed the boxes
+        const ck = pin_route(sc, c0, false);
         return flat_of(ck.k) && !(dst && loop_head(sc.seg.def)
           && loop_of(ck.k).includes(sc.seg.def))
           ? emit_put(sc, dst, inl_q(sc, ck) ? emit_inl(sc, ck)
@@ -4309,13 +4312,13 @@ function emit_body(sc: Scope, tm: HTerm, ty0: HTerm | null, args: Val[],
           : emit_body({ ...sc, def: ck.k }, h!, ck.tld!.T,
             emit_args(sc, ck, true), dst);
       }
-      if (!lay_eq(sc.seg.ret, ret)
-        && (sc.seg.ret.arms !== null || ret.arms !== null)) {
+      // a cut where the results' lays differ, or where a tail call would
+      // leave the callee a box (pin_fresh)
+      const ck = pin_route(sc, c0);
+      if ((!lay_eq(sc.seg.ret, ret)
+        && (sc.seg.ret.arms !== null || ret.arms !== null))
+        || (ty !== null && pin_fresh(sc, ck, true))) {
         return emit_body(sc, Bend.Let(["r"], [0], [Bend.Ann(x, ty!)],
-          (xs) => xs[0]), ty, args, dst);
-      }
-      if (ty && pin_fresh(sc, ck, true)) {
-        return emit_body(sc, Bend.Let(["r"], [0], [Bend.Ann(x, ty)],
           (xs) => xs[0]), ty, args, dst);
       }
       const vals = emit_args(sc, ck, true);
@@ -4905,8 +4908,12 @@ function c_units(): Unit[] {
     was = FL.facts.size;
     FL.units.forEach(unit_emit);
     const us = [...FL.units.values()];
+    // a def and its copy (pin_defs) share their body, so a parameter one
+    // of them is lent is lent to both
     const lent = graph_close(new Set(us.flatMap((u) => [...u.lent])),
-      us.flatMap((u) => u.lends.map(([at, r]) => [r, at])));
+      [...us.flatMap((u) => u.lends.map(([at, r]) => [r, at])),
+        ...[...FL.pinof].flatMap(([d, dp]) => fun_of(d).lays.flatMap((_, i) =>
+          [[arg_key(d, i), arg_key(dp, i)], [arg_key(dp, i), arg_key(d, i)]]))]);
     for (const [k] of done_defs()) {
       brw_of(k).forEach((b, i) => b && !lent.has(arg_key(k, i))
         && fact_add("own", arg_key(k, i)));
