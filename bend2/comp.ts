@@ -1074,6 +1074,15 @@ function unit_def(): Name {
   return FL.unit!.name.replace(/^spin /, "");
 }
 
+// Only a unit that can be in rets goes through the probe: a live def with a
+// box result and a box parameter, or a unit that is no live def.
+function ret_can(unit: string): boolean {
+  const k = unit.replace(/^spin /, "");
+  const { ret, lays } = fun_of(k);
+  return !done_live(tld_of(k))
+    || ret.ks.join() === "box" && lays.some((l) => l.ks.join() === "box");
+}
+
 function ret_at(k: Name): number {
   const i = FL.rets.get(k) ?? -1;
   return i >= 0 && !fact("rown", k) && brw_of(k)[i] ? i : -1;
@@ -2894,7 +2903,7 @@ function c_units(): Unit[] {
     });
   }
   FL.probe = true;
-  FL.units.forEach(unit_emit);
+  FL.units.forEach((u) => ret_can(u.name) && unit_emit(u));
   FL.probe = false;
   FL.cand.forEach((rs, k) => {
     const i = Number([...rs][0].slice(k.length + 1));
