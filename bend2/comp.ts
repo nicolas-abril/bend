@@ -3718,7 +3718,49 @@ function ix_site(sc: Scope, k: Name, m: Spine): boolean {
   return true;
 }
 
+// Array.sets nested on an array of one-word cells, of variables or
+// constants, at one variable plus constants (or constants) at most 31
+// apart: below the end they go through one pointer, unmasked, so clang
+// merges them.
+function set_run(sc: Scope, m: Spine): Val | null {
+  const its: Spine[] = [];
+  for (let c = m; c.t.$ === "Ref" && c.t.k === "Array.set";
+    c = term_spine(term_strip(c.args[0]))) {
+    its.unshift(c);
+  }
+  // an index is a variable plus a constant, or a constant (base -1)
+  const at = its.map(({ args: [, i, v] }): [number, number] | null => {
+    const [x, c] = term_spine(term_strip(i)).t.$ === "Ref"
+      && term_spine(term_strip(i)).t.k === "U32.add"
+      ? term_spine(term_strip(i)).args.map(term_strip) : [term_strip(i)];
+    const n = (t: HTerm) => term_const(t) ? Bend.u32_from_term(t) : null;
+    return term_strip(v).$ !== "Var" && !term_const(v) ? null
+      : x.$ === "Var" && (!c || n(c) !== null) ? [x.i, c ? n(c)! : 0]
+      : !c && n(x) !== null ? [-1, n(x)!] : null;
+  });
+  const lo = Math.min(...at.map((o) => o?.[1] ?? 0));
+  if (its.length < 4 || !sc.seg.native || lay_el(m.all[0]).ks.join() !== "w32"
+    || at.some((o) => !o || o[0] !== at[0]![0] || o[1] - lo > 31)) {
+    return null;
+  }
+  const vs = emit_each(sc, [its[0].args[0], ...its.flatMap((c) =>
+    c.args.slice(1))]).map((v) => val_own(v)[0]);
+  const a = emit_alias(sc, vs[0], "a");
+  const [l, b] = emit_hold(sc, [arr_loc(sc, a), `(u32)${vs[1 + 2 * at
+    .findIndex((o) => o![1] === lo)]} & (u32)(blk_size(${a}) - 1)`], "b");
+  arr_event(sc, [a]);
+  file_push(sc, `if (${b} + 31 < blk_size(${a})) {`, ...at.map((o, j) =>
+    `  blk_ptr(e.mem, ${l}, ${b})[${o![1] - lo}] = (u32)${vs[2 + 2 * j]};`),
+  "} else {", ...at.map((_, j) => `  blk_write(e.mem, 0, ${l}, blk_at(${a}, ${
+    vs[1 + 2 * j]}, 0), ${vs[2 + 2 * j]});`), "}");
+  return val_new([a], BOX);
+}
+
 function emit_intr(sc: Scope, k: Name, m: Spine, ty: HTerm | null): Val {
+  const run = k === "Array.set" ? set_run(sc, m) : null;
+  if (run) {
+    return run;
+  }
   const steal = k === "Array.set" && place_take(sc, m.args.map(term_strip));
   const bare = ix_site(sc, k, m);
   const args = emit_each(sc, m.args);
@@ -6347,6 +6389,8 @@ INLINE void blk_write(DEV u64* H, bool arr, u64 loc, u32 i, Term v) {
     *blk_ptr(H, loc, i) = (u32)v;
   }
 }
+
+#define blk_size(a) (1ull << blk_cls(a))
 
 INLINE u32 blk_at(Term a, u64 i, u32 lgs) {
   return ((u32)i & (u32)((1ull << (blk_cls(a) - lgs)) - 1)) << lgs;
