@@ -6600,7 +6600,9 @@ FAR Term work_loop(Env e, DEV Term* sp, Term t, u32 seq);
 // waits for whoever took it, running others' tasks meanwhile. The oldest
 // frame holds the largest part left; a drain ends when its claims do, as a
 // claim waits for every task split off it. A split task's last delivery
-// hands back its future like a join; whoever ran the task drops it.
+// hands back its future like a join; whoever ran the task drops it. Threads
+// hunt only on cores no claim holds (fk_busy): with more threads than cores,
+// a spinning hunter would slow the claim it waits on.
 
 typedef struct { DEV Term* at; u32 site; u32 slot; Term task; Term fut; } FkEnt;
 
@@ -6611,6 +6613,8 @@ static u32  fk_hungry;
 static u32  fk_boxed;
 static u32  fk_hunters;
 static u32  fk_sleepers;
+static u32  fk_busy;
+static u32  fk_cores;
 static pthread_mutex_t fk_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  fk_bell = PTHREAD_COND_INITIALIZER;
 static u64  fk_mask[CUBE_T] __attribute__((aligned(128)));
@@ -6624,10 +6628,13 @@ static Term fk_box[CUBE_T][FK_SLOTS] __attribute__((aligned(128)));
 #define fk_relax() ((void)0)
 #endif
 
+static long cpu_count(void);
+
 static void fk_init(u64* alc, u32 w) {
   if (pool_size < 2) {
     return;
   }
+  fk_cores = (u32)cpu_count();
   FkEnt* l = pool_mmap(1ull << 32);
   alc[FK_TOP]  = (u64)l;
   alc[FK_LOW]  = (u64)l;
@@ -6667,18 +6674,19 @@ static Term fk_take(Env e) {
   return 0;
 }
 
-// The thread's oldest unsplit frame below its newest (whose frame may not
-// be written yet) becomes a task, at most once per FK_GAP ns of a thread:
-// tasks too small to be worth a split would otherwise be split at every
-// fork while a drain's tail is hungry.
-#define FK_GAP 20000
+// The thread's oldest unsplit frame with FK_DEEP notes above it (the newest's
+// frame may not be written yet) becomes a task, at most once per FK_GAP ns
+// of a thread: tasks too small to be worth a split would otherwise be split
+// at every fork while a drain's tail is hungry.
+#define FK_GAP  20000
+#define FK_DEEP 4
 static u64 io_tick(void);
 
 FAR void fk_poll(Env e) {
   FkEnt* lo   = (FkEnt*)e.alc[FK_LOW];
   FkEnt* hi   = (FkEnt*)e.alc[FK_TOP] - 1;
   u64    bits = e.alc[FK_BITS];
-  if (lo >= hi || ~bits == 0 || err_seen(e.mem)) {
+  if (lo + FK_DEEP > hi || ~bits == 0 || err_seen(e.mem)) {
     return;
   }
   u64 now = io_tick();
@@ -7199,13 +7207,16 @@ static u32 pool_step(u32 rows) {
 
 static u32 pool_rows(Env e, DEV Term* stk) {
   u32 n = 0;
+  a32_add(&fk_busy, 1);
   for (;;) {
     u32 c    = a32_add(&pool_row, 1);
     u32 r    = c & 32767;
     u32 rows = c >> 15 & 255;
     u32 step = c >> 23 & 1 ? 1 : pool_step(rows);
     if (r >= rows * step) {
-      bool hunt = !(c >> 23 & 1) && e.alc[FK_TOP];
+      a32_sub(&fk_busy, 1);
+      bool hunt = !(c >> 23 & 1) && e.alc[FK_TOP]
+        && a32_load(&fk_hunters) + a32_load(&fk_busy) < fk_cores;
       if (hunt) {
         a32_add(&fk_hunters, 1);
       }

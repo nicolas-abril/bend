@@ -34,7 +34,10 @@ def rounds(+r: Nat, +acc: U32) -> U32:
     case 1n+p:
       rounds(p, (acc + tree(5n, pair(acc)) : U32))
 
-def main() -> U32:
+def run() -> U32:
   rounds(60n, 1)
+
+def main() -> IO(Unit):
+  IO.print(U32.show(run()))
 
 #|2368164865

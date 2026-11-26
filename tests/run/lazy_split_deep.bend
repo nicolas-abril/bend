@@ -37,8 +37,11 @@ def top(+n: Nat) -> U32:
   (a + b + c + d : U32)
 
 # the filler takes the rows a grow fills, so the chains run in a drain
-def main() -> U32:
+def run() -> U32:
   x y = fill(9n, 1) top(20000n)
   (x + y : U32)
+
+def main() -> IO(Unit):
+  IO.print(U32.show(run()))
 
 #|1363575357
