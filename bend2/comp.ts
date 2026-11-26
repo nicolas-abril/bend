@@ -7365,11 +7365,17 @@ static MTLComputePipelineDescriptor* gpu_desc(void) {
   return d;
 }
 
+// A pipeline compiled into an archive alone is not kept in Metal's shader
+// cache, so the pipeline is made first: a rebuild of the same program then
+// reads it from the cache (0.04 s against 0.13-0.8 s), at no cost cold.
 static bool gpu_make(const char* path) {
   NSError* err = nil;
   id<MTLBinaryArchive> ar = [gpu_dev
     newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&err];
-  if (![ar addComputePipelineFunctionsWithDescriptor:gpu_desc() error:&err]) {
+  MTLComputePipelineDescriptor* d = gpu_desc();
+  if (![gpu_dev newComputePipelineStateWithDescriptor:d options:0
+      reflection:nil error:&err]
+    || ![ar addComputePipelineFunctionsWithDescriptor:d error:&err]) {
     gpu_fail(err);
   }
   return [ar serializeToURL:[NSURL fileURLWithPath:@(path)] error:&err];
