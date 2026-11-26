@@ -129,6 +129,8 @@ type Fun = { n: number; h: HTerm | null; live: Dom[]; lays: Lay[]; ret: Lay };
 // is a device call (DFAR), and a host call too if it loops on F32 math (SLP
 // misjudges it); a loop's call to a spin of several sites and over HOT_SIZE
 // terms, its callees' included, is inlined there (HOT): clang would call it;
+// so is a call, in a loop or a def a loop calls, to a spin that loops or
+// calls one (nest_of): clang calls tar's chain walk, at 1.4x the cycles;
 // a node past WIDE pads to its size class.
 
 const CLO_APPLY = "Clo~apply";
@@ -1894,6 +1896,8 @@ function file_new(book: Bend.Book, js: boolean) {
     srcs: new Map<Name, Set<Name> | null>(),
     loops: new Map<Name, Name[]>(),
     flats: new Map<Name, boolean>(),
+    inner: new Set<Name>(),
+    nests: new Map<Name, number>(),
     made: Object.create(null) as Record<Name, Bend.Def>,
     clos: new Map<Name, Map<string, Name | null>>(),
     clo_of: new Map<Name, { k: Name; n: number }>(),
@@ -2017,7 +2021,7 @@ function file_book(roots: Name[]): void {
     FL.srcs.set(d, flat ? deps : null);
   }
   if ([...own].filter(def_fix).length > 0) {
-    [FL.sites, FL.loops, FL.flats].forEach((m) => m.clear());
+    [FL.sites, FL.loops, FL.flats, FL.inner, FL.nests].forEach((m) => m.clear());
     file_book(roots);
   }
 }
@@ -3041,7 +3045,8 @@ function emit_spin(sc: Scope, ck: Spine): Val {
       ++n > HOT_SIZE || y.$ === "Ref" && y.k !== d && !intr_of(y.k)
         && flat_of(y.k) && big(y.k));
     const hot = loop_of(sc.def).length > 0 && loop_of(k).length === 0
-      && FL.sites.get(k)! > 1 && big(k) ? "HOT " : "";
+      && FL.sites.get(k)! > 1 && big(k) || nest_of(k) === 1
+      && (loop_of(sc.def).length > 0 || inner_of().has(sc.def)) ? "HOT " : "";
     emit_lanes(sc, k, ws, ls, o);
     block(sc, `${hot}if (${name}(${["e", o, ...xs].join(", ")}) == 0) {`, () =>
       file_push(sc, "return 0;"));
@@ -3049,6 +3054,28 @@ function emit_spin(sc: Scope, ck: Spine): Val {
   bind_dead(sc, sc.rest,
     ck.xs.map(term_strip).filter((x) => x.$ === "Var").map(probe_of));
   return out;
+}
+
+// Whether k, or a def it calls, loops (1) or does F32 math (2: SLP
+// misjudges it inlined).
+function nest_of(k: Name): number {
+  return memo(FL.nests, k, () => {
+    let m = FL.nests.set(k, 0) && loop_of(k).length > 0 ? 1 : 0;
+    term_any(fun_of(k).h!, (y) => (y.$ === "Ref" && (m |= y.k.startsWith("F32.")
+      ? 2 : !intr_of(y.k) && flat_of(y.k) ? nest_of(y.k) : 0), false));
+    return m;
+  });
+}
+
+// The defs a loop calls, their callees included ("" once built).
+function inner_of(): Set<Name> {
+  if (!FL.inner.has("")) {
+    FL.inner.add("");
+    const go = (d: Name) => FL.srcs.get(d)?.forEach((x) =>
+      FL.inner.has(x) || (FL.inner.add(x), go(x)));
+    [...FL.srcs.keys()].filter((d) => loop_of(d).length > 0).forEach(go);
+  }
+  return FL.inner;
 }
 
 // The index of a native's countdown: a Nat every self-jump passes the
