@@ -19,7 +19,7 @@ type Kind = "w32" | "w64" | "box";
 type Lay = { ks: Kind[]; arms: Record<Name, Lay[]> | null };
 
 type Val = { ws: string[]; lay: Lay; stat: boolean; rs: (string | null)[];
-  iv?: Iv; nv?: Nv; sink?: boolean };
+  iv?: Iv; nv?: Nv };
 
 type Bind = { val: Val; n: number; A: HTerm };
 
@@ -2298,12 +2298,9 @@ function nv_res(out: Val, k: Name, vals: Val[]): void {
   }
 }
 
-// A native's parameters take every value its def's calls pass; a sum
-// tested where the loop answers it (nv_sinks) is tested there and every
-// 2^n turns (nv_turns), and no add on the way.
-function nv_params(k: Name, vals: Val[], lane = false): void {
+// A native's parameters take every value its def's calls pass.
+function nv_params(k: Name, vals: Val[]): void {
   const P = FL.nv?.P.get(k);
-  const sink = lane ? undefined : FL.nv?.sink.get(k);
   const doms = tele_unbind(tld_of(k).T).doms;
   const at = P?.flatMap((_, j) => j < doms.length && !dom_live(doms[j]) ? []
     : [j]) ?? [];
@@ -2312,32 +2309,13 @@ function nv_params(k: Name, vals: Val[], lane = false): void {
     if (got && v.ws.length === 1 && at.length === vals.length) {
       v.nv = got;
     }
-    if (sink?.has(at[i]) && v.ws.length === 1 && at.length === vals.length) {
-      delete v.nv;
-      v.sink = true;
-    }
   });
-}
-
-function nv_turns(k: Name, seg: Seg, vals: Val[]): void {
-  const sink = FL.nv?.sink.get(k);
-  const P = FL.nv?.P.get(k);
-  const doms = tele_unbind(tld_of(k).T).doms;
-  const at = P?.flatMap((_, j) => j < doms.length && !dom_live(doms[j]) ? []
-    : [j]) ?? [];
-  if (!seg.spin || !sink || sink.size === 0 || seg.lane) {
-    return;
-  }
-  seg.lines.unshift(...vals.flatMap((v, i) => v.sink && sink.has(at[i])
-    ? [`if ((++wpoll & ${sink.get(at[i])}) == 0) {`,
-      `  ${v.ws[0]} = nat_chk(e, ${v.ws[0]});`, "}"] : []));
 }
 
 // out holds the value v does: so its bounds
 function nv_keep(out: Val, v: Val): Val {
-  if (out.ws.length === 1 && v.ws.length === 1) {
-    v.nv && (out.nv = v.nv);
-    v.sink && (out.sink = true);
+  if (v.nv && out.ws.length === 1 && v.ws.length === 1) {
+    out.nv = v.nv;
   }
   return out;
 }
@@ -3075,8 +3053,7 @@ function emit_put(sc: Scope, dst: Val | null, v: Val): void {
   if (!lent && !FL.probe && !sc.inl) {
     FL.rets.has(u) && fact_add("rown", u);
   }
-  const ws = (lent ? w.ws : val_own(w)).map((x) => w.sink
-    ? `nat_chk(e, ${x})` : x);
+  const ws = lent ? w.ws : val_own(w);
   if (dst && FL.ix) {
     ws.forEach((x, j) => ix_out(sc, dst.ws[j], x));
   }
@@ -3401,11 +3378,10 @@ function emit_native(sc: Scope, k: Name, to?: Name,
       // a pass names its words as the last did: what those lent is not its
       FL.unit!.arrs.clear();
       const [sl, vals] = emit_open(k, lend);
-      nv_params(k, vals, !!to);
+      nv_params(k, vals);
       const seg = Object.assign(sl.seg, { fid: name, native: true, lane: to });
       emit_body(sl, fun_of(k).h!, tld_of(k).T, vals,
         val_new(seg.ret.ks.map((_, j) => `o[${j}]`), seg.ret));
-      nv_turns(k, seg, vals);
       return seg;
     };
     const ix: Ix = FL.ix = { forms: new Map(), roles: null, info: new Map(),
@@ -3832,7 +3808,6 @@ type NvCx = { k: Name; ps: Map<number, number>; pv: number[];
 type NvBook = { P: Map<Name, (Nv | null)[]>; E: Map<Name, (Nv | null)[]>;
   R: Map<Name, Nv | null>; top: Set<Name>; rel: Map<Name, (NvRel | null)[]>;
   sites: Map<Name, Map<HTerm, NvRel[][]>>; rels: boolean; moved: boolean;
-  sink: Map<Name, Map<number, number>>;
   walks: Map<Name, number>; calls: Map<Name, Set<Name>>; queue: Name[];
   queued: Set<Name>; erased: Map<HTerm, [HTerm, HTerm]> };
 
@@ -3841,11 +3816,6 @@ const NAT_MAX = 2 ** 48 - 1;
 const NV_TOP: Nv = [0, NAT_MAX];
 
 const NV_ROUNDS = 64;
-
-// Off: on collatz, the one Osprey kernel it reaches, the sequential port
-// ran 3.8% fewer cycles and the forked one 5.2% more (16-placement sweep),
-// at 20 to 30% more instructions (the turn count); see nv_sinks.
-const NV_SINK = false;
 
 const NV_BARE: Record<Name, string> = { "Nat.add": "($0 + $1)",
   "Nat.double": "($0 + $0)", "Nat.mul": "($0 * $1)" };
@@ -3924,7 +3894,6 @@ function nv_call(k: Name, as: (Nv | null | undefined)[]): Nv | undefined {
 function nv_book(): void {
   const st: NvBook = FL.nv = { P: new Map(), E: new Map(), R: new Map(),
     top: new Set(), rel: new Map(), sites: new Map(), rels: false,
-    sink: new Map(),
     moved: false, walks: new Map(), calls: new Map(),
     queue: [], queued: new Set(), erased: new Map() };
   const defs = done_defs().map(([k]) => k).filter((k) => fun_of(k).h !== null
@@ -4105,7 +4074,6 @@ function nv_def(k: Name): void {
     // a parameter the loop steps down goes down to 0
     return nv_widen(old, got && down.has(j) ? [0, got[1]] : got, walks);
   });
-  st.sink.set(k, nv_sinks(k, cx, P2));
   if (P2.some((v, j) => !nv_same(v, P[j]))) {
     st.P.set(k, P2);
     nv_push(k);
@@ -4331,82 +4299,6 @@ function nv_split(x: HTerm, m: Spine, cx: NvCx): Nv | null | undefined {
   return nv_join(lo, hi);
 }
 
-// A loop's sum that grows on two self-calls or more, by bounded amounts,
-// and is read nowhere else but where the loop answers it, is tested at that
-// answer, and every 2^n turns so its word cannot wrap (n: the most turns
-// that cannot, at most 15): a test in each arm keeps clang from merging
-// them. Only if nothing the loop calls may run forever (no @unsafe def):
-// the program still stops with the same message, a bounded number of turns
-// later. Answers, for each such parameter, the mask of its turn count.
-function nv_sinks(k: Name, cx: NvCx, P: (Nv | null)[]): Map<number, number> {
-  const out = new Map<number, number>();
-  const n = fun_of(k).n;
-  for (let j = 0; j < n && NV_SINK && cx.selfs.length >= 2 && !cx.clo; j++) {
-    const ss = cx.selfs.map((s) => s[j]);
-    const gs = ss.filter((s) => s !== "same" && s?.how === "grow"
-      && s.p === j) as NvStep[];
-    const B = Math.max(1, ...gs.map((s) => s.c));
-    const bits = Math.min(15, Math.floor(Math.log2((2 ** 64 - 2 ** 48) / B)));
-    if (gs.length < 2 || gs.length + ss.filter((s) => s === "same").length
-      < ss.length || P[j] === null || P[j]![1] + B <= NAT_MAX || bits < 1
-      || !nv_reads(k, cx, j) || !nv_quiet(k, new Set())) {
-      continue;
-    }
-    out.set(j, 2 ** bits - 1);
-  }
-  return out;
-}
-
-// Whether k and all it calls are checked to end (none is @unsafe), the
-// loop k makes aside.
-function nv_quiet(k: Name, seen: Set<Name>): boolean {
-  if (seen.has(k)) {
-    return true;
-  }
-  seen.add(k);
-  return !term_any(fun_of(k).h ?? DUMMY, (y) => y.$ === "Ref" && y.k !== k
-    && !intr_of(y.k) && (!done_live(tld_of(y.k)) || !!(tld_of(y.k) as
-      Bend.Def).u || !nv_quiet(y.k, seen)));
-}
-
-// Whether parameter j of k is read only as an operand of the adds that pass
-// it to the next turn, or where k answers.
-function nv_reads(k: Name, cx: NvCx, j: number): boolean {
-  const mine = (i: number) => cx.ps.get(i) === j
-    || (cx.steps.get(i)?.how === "grow" && cx.steps.get(i)!.p === j);
-  // the reads of j along a chain of adds
-  const chain = (t: HTerm): number => {
-    const s = term_strip(t);
-    if (s.$ === "Var") {
-      return mine(s.i) ? 1 : 0;
-    }
-    const m = term_spine(s);
-    return m.t.$ === "Ref" && m.t.k === "Nat.add" && m.args.length === 2
-      ? chain(m.args[0]) + chain(m.args[1]) : 0;
-  };
-  let all = 0;
-  let ok = 0;
-  term_any(fun_of(k).h!, (s, tail) => {
-    if (s.$ === "Var" && mine(s.i)) {
-      all++;
-      ok += Number(tail);
-    } else if (s.$ === "Let") {
-      const o = term_open(s);
-      o.ps.forEach((p, i) => cx.steps.get(p.i)?.how === "grow"
-        && cx.steps.get(p.i)!.p === j && (ok += chain(s.v[i])));
-    } else if (s.$ === "App" || s.$ === "Var") {
-      const m = term_spine(s);
-      if (m.t.$ === "Ref" && m.t.k === k && m.all.length === fun_of(k).n) {
-        ok += chain(m.all[j]);
-      } else if (tail) {
-        ok += chain(s);
-      }
-    }
-    return false;
-  });
-  return all > 0 && all === ok;
-}
-
 // How argument x steps a parameter of the def walked.
 function nv_step(x: HTerm, cx: NvCx, deep = 0,
   want?: number): NvStep | "same" | null {
@@ -4531,9 +4423,7 @@ function emit_intr(sc: Scope, k: Name, m: Spine, ty: HTerm | null): Val {
   const bare = ix_site(sc, k, m);
   const args = emit_each(sc, m.args);
   const nvs = args.map((v) => v.nv);
-  const sink = k === "Nat.add" && args.some((v) => v.sink);
-  const C = !FL.js && (sink || nv_safe(k, nvs)) ? NV_BARE[k]
-    : intr_of(k)!.C!;
+  const C = !FL.js && nv_safe(k, nvs) ? NV_BARE[k] : intr_of(k)!.C!;
   if (/^Array\.(new|clone)$/.test(k)
     && lay_el(m.all[0]).ks.includes("box")
     && !(k === "Array.new" && ctr_packed(m.all[2]))) {
@@ -4545,14 +4435,13 @@ function emit_intr(sc: Scope, k: Name, m: Spine, ty: HTerm | null): Val {
   const lays = fun_of(k).lays;
   const as = args.map((v, i) => val_own(val_to(sc, v, lays[i]))[0])
     .map((w, i) => op_bare(m.args[i]) && !w.startsWith("term_keep") ? w
-      : emit_alias(sc, w, "a"))
-    .map((w, i) => args[i].sink && !sink ? `nat_chk(e, ${w})` : w);
+      : emit_alias(sc, w, "a"));
   const lay = lay_of(ty);
-  const got = sink ? undefined : nv_op(k, nvs);
+  const got = nv_op(k, nvs);
   return Array.isArray(C)
     ? val_new(C.map((p) => emit_alias(sc, tpl(p, as), "a")), lay)
     : { ...val_new([tpl(C, as)], lay.ks.length === 1 ? lay : BOX),
-      ...got && { nv: got }, ...sink && { sink } };
+      ...got && { nv: got } };
 }
 
 function emit_clo(sc: Scope, x: HTerm, ty: HTerm | null): Val {
