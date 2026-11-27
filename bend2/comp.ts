@@ -4441,7 +4441,9 @@ function emit_body(sc: Scope, tm: HTerm, ty0: HTerm | null, args: Val[],
       }
       const cargs = vals.flatMap((v) => v.ws);
       spare_flush(sc);
-      emit_jump(sc, cargs, ck.k, ck.b);
+      emit_jump(sc, cargs, ck.k, ck.b, !ck.b && sc.seg.def !== ck.k
+        && memo(FL.trees, ck.k, (k) => term_calls(fun_of(k).h ?? DUMMY, k) > 1)
+        ? [`//tail ${seg_fid(ck.k)}`] : []);
     }
   }
 }
@@ -5146,6 +5148,22 @@ function segs_base(segs: Seg[], dev: Set<string>): void {
         ls.splice(at, 2, ...gpu
           ? ["#if DEVICE", ls[at], ls[at + 1], "#else", host, "#endif"] : [host]);
       }
+    }
+  }
+  // A tail call into a tree runs the callee's answering arm itself (host
+  // only): its return is the callee's, on the same stack, so the common
+  // return of a continuation that resumes the recursion (ack_k1 into ack)
+  // takes one branch, not two. Only a callee with one answering arm of at
+  // most 48 lines: with two, a miss runs the tests again in the callee
+  // (fib_acc_k1: +8.5% cycles at every code position; respelled pascal +20%).
+  for (const { lines: ls } of segs) {
+    for (let i = ls.length; i-- > 0;) {
+      const m = ls[i].match(/^( *)\/\/tail (\S+)$/);
+      const a = m && arms.get(m[2]);
+      const b = a && a.length <= 48
+        && a.filter((x) => /WL_RETN/.test(x)).length === 1 ? a : null;
+      m && ls.splice(i, 1, ...b ? seg_text(["if (!DEVICE) {",
+        ...b.map((x) => "  " + x), "}"], m[1].length / 2) : []);
     }
   }
 }
