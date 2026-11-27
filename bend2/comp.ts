@@ -129,6 +129,8 @@ type Fun = { n: number; h: HTerm | null; live: Dom[]; lays: Lay[]; ret: Lay };
 // is a device call (DFAR), and a host call too if it loops on F32 math (SLP
 // misjudges it); a loop's call to a spin of several sites and over HOT_SIZE
 // terms, its callees' included, is inlined there (HOT): clang would call it;
+// so is a call, in a loop or a def a loop calls, to a spin that loops or
+// calls one (nest_of): clang calls tar's chain walk, at 1.4x the cycles;
 // a node past WIDE pads to its size class.
 
 const CLO_APPLY = "Clo~apply";
@@ -1186,6 +1188,15 @@ function unit_def(): Name {
   return FL.unit!.name.replace(/^spin /, "");
 }
 
+// Only a unit that can be in rets goes through the probe: a live def with a
+// box result and a box parameter, or a unit that is no live def.
+function ret_can(unit: string): boolean {
+  const k = unit.replace(/^spin /, "");
+  const { ret, lays } = fun_of(k);
+  return !done_live(tld_of(k))
+    || ret.ks.join() === "box" && lays.some((l) => l.ks.join() === "box");
+}
+
 function ret_at(k: Name): number {
   const i = FL.rets.get(k) ?? -1;
   return i >= 0 && !fact("rown", k) && brw_of(k)[i] ? i : -1;
@@ -1885,6 +1896,8 @@ function file_new(book: Bend.Book, js: boolean) {
     srcs: new Map<Name, Set<Name> | null>(),
     loops: new Map<Name, Name[]>(),
     flats: new Map<Name, boolean>(),
+    inner: new Set<Name>(),
+    nests: new Map<Name, number>(),
     made: Object.create(null) as Record<Name, Bend.Def>,
     clos: new Map<Name, Map<string, Name | null>>(),
     clo_of: new Map<Name, { k: Name; n: number }>(),
@@ -2009,7 +2022,7 @@ function file_book(roots: Name[]): void {
     FL.srcs.set(d, flat ? deps : null);
   }
   if ([...own].filter(def_fix).length > 0) {
-    [FL.sites, FL.loops, FL.flats].forEach((m) => m.clear());
+    [FL.sites, FL.loops, FL.flats, FL.inner, FL.nests].forEach((m) => m.clear());
     file_book(roots);
   }
 }
@@ -3107,7 +3120,8 @@ function emit_spin(sc: Scope, ck: Spine): Val {
       ++n > HOT_SIZE || y.$ === "Ref" && y.k !== d && !intr_of(y.k)
         && flat_of(y.k) && big(y.k));
     const hot = loop_of(sc.def).length > 0 && loop_of(k).length === 0
-      && FL.sites.get(k)! > 1 && big(k) ? "HOT " : "";
+      && FL.sites.get(k)! > 1 && big(k) || nest_of(k) === 1
+      && (loop_of(sc.def).length > 0 || inner_of().has(sc.def)) ? "HOT " : "";
     emit_lanes(sc, k, ws, ls, o);
     block(sc, `${hot}if (${name}(${["e", o, ...xs].join(", ")}) == 0) {`, () =>
       file_push(sc, "return 0;"));
@@ -3115,6 +3129,28 @@ function emit_spin(sc: Scope, ck: Spine): Val {
   bind_dead(sc, sc.rest,
     ck.xs.map(term_strip).filter((x) => x.$ === "Var").map(probe_of));
   return out;
+}
+
+// Whether k, or a def it calls, loops (1) or does F32 math (2: SLP
+// misjudges it inlined).
+function nest_of(k: Name): number {
+  return memo(FL.nests, k, () => {
+    let m = FL.nests.set(k, 0) && loop_of(k).length > 0 ? 1 : 0;
+    term_any(fun_of(k).h!, (y) => (y.$ === "Ref" && (m |= y.k.startsWith("F32.")
+      ? 2 : !intr_of(y.k) && flat_of(y.k) ? nest_of(y.k) : 0), false));
+    return m;
+  });
+}
+
+// The defs a loop calls, their callees included ("" once built).
+function inner_of(): Set<Name> {
+  if (!FL.inner.has("")) {
+    FL.inner.add("");
+    const go = (d: Name) => FL.srcs.get(d)?.forEach((x) =>
+      FL.inner.has(x) || (FL.inner.add(x), go(x)));
+    [...FL.srcs.keys()].filter((d) => loop_of(d).length > 0).forEach(go);
+  }
+  return FL.inner;
 }
 
 // The index of a native's countdown: a Nat every self-jump passes the
@@ -4446,7 +4482,49 @@ function nv_rel_fix(cx: NvCx, j: number | undefined,
   return [[pa, na], [pb, nb]].filter(([p]) => p >= 0) as [number, Nv][];
 }
 
+// Array.sets nested on an array of one-word cells, of variables or
+// constants, at one variable plus constants (or constants) at most 31
+// apart: below the end they go through one pointer, unmasked, so clang
+// merges them.
+function set_run(sc: Scope, m: Spine): Val | null {
+  const its: Spine[] = [];
+  for (let c = m; c.t.$ === "Ref" && c.t.k === "Array.set";
+    c = term_spine(term_strip(c.args[0]))) {
+    its.unshift(c);
+  }
+  // an index is a variable plus a constant, or a constant (base -1)
+  const at = its.map(({ args: [, i, v] }): [number, number] | null => {
+    const [x, c] = term_spine(term_strip(i)).t.$ === "Ref"
+      && term_spine(term_strip(i)).t.k === "U32.add"
+      ? term_spine(term_strip(i)).args.map(term_strip) : [term_strip(i)];
+    const n = (t: HTerm) => term_const(t) ? Bend.u32_from_term(t) : null;
+    return term_strip(v).$ !== "Var" && !term_const(v) ? null
+      : x.$ === "Var" && (!c || n(c) !== null) ? [x.i, c ? n(c)! : 0]
+      : !c && n(x) !== null ? [-1, n(x)!] : null;
+  });
+  const lo = Math.min(...at.map((o) => o?.[1] ?? 0));
+  if (its.length < 4 || !sc.seg.native || lay_el(m.all[0]).ks.join() !== "w32"
+    || at.some((o) => !o || o[0] !== at[0]![0] || o[1] - lo > 31)) {
+    return null;
+  }
+  const vs = emit_each(sc, [its[0].args[0], ...its.flatMap((c) =>
+    c.args.slice(1))]).map((v) => val_own(v)[0]);
+  const a = emit_alias(sc, vs[0], "a");
+  const [l, b] = emit_hold(sc, [arr_loc(sc, a), `(u32)${vs[1 + 2 * at
+    .findIndex((o) => o![1] === lo)]} & (u32)(blk_size(${a}) - 1)`], "b");
+  arr_event(sc, [a]);
+  file_push(sc, `if (${b} + 31 < blk_size(${a})) {`, ...at.map((o, j) =>
+    `  blk_ptr(e.mem, ${l}, ${b})[${o![1] - lo}] = (u32)${vs[2 + 2 * j]};`),
+  "} else {", ...at.map((_, j) => `  blk_write(e.mem, 0, ${l}, blk_at(${a}, ${
+    vs[1 + 2 * j]}, 0), ${vs[2 + 2 * j]});`), "}");
+  return val_new([a], BOX);
+}
+
 function emit_intr(sc: Scope, k: Name, m: Spine, ty: HTerm | null): Val {
+  const run = k === "Array.set" ? set_run(sc, m) : null;
+  if (run) {
+    return run;
+  }
   const steal = k === "Array.set" && place_take(sc, m.args.map(term_strip));
   const bare = ix_site(sc, k, m);
   const args = emit_each(sc, m.args);
@@ -5439,7 +5517,7 @@ function c_units(): Unit[] {
     });
   }
   FL.probe = true;
-  FL.units.forEach(unit_emit);
+  FL.units.forEach((u) => ret_can(u.name) && unit_emit(u));
   FL.probe = false;
   FL.cand.forEach((rs, k) => {
     const i = Number([...rs][0].slice(k.length + 1));
@@ -7094,6 +7172,8 @@ INLINE void blk_write(DEV u64* H, bool arr, u64 loc, u32 i, Term v) {
   }
 }
 
+#define blk_size(a) (1ull << blk_cls(a))
+
 INLINE u32 blk_at(Term a, u64 i, u32 lgs) {
   return ((u32)i & (u32)((1ull << (blk_cls(a) - lgs)) - 1)) << lgs;
 }
@@ -7373,7 +7453,9 @@ FAR Term work_loop(Env e, DEV Term* sp, Term t, u32 seq);
 // waits for whoever took it, running others' tasks meanwhile. The oldest
 // frame holds the largest part left; a drain ends when its claims do, as a
 // claim waits for every task split off it. A split task's last delivery
-// hands back its future like a join; whoever ran the task drops it.
+// hands back its future like a join; whoever ran the task drops it. Threads
+// hunt only on cores no claim holds (fk_busy): with more threads than cores,
+// a spinning hunter would slow the claim it waits on.
 
 typedef struct { DEV Term* at; u32 site; u32 slot; Term task; Term fut; } FkEnt;
 
@@ -7384,6 +7466,8 @@ static u32  fk_hungry;
 static u32  fk_boxed;
 static u32  fk_hunters;
 static u32  fk_sleepers;
+static u32  fk_busy;
+static u32  fk_cores;
 static pthread_mutex_t fk_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  fk_bell = PTHREAD_COND_INITIALIZER;
 static u64  fk_mask[CUBE_T] __attribute__((aligned(128)));
@@ -7397,10 +7481,13 @@ static Term fk_box[CUBE_T][FK_SLOTS] __attribute__((aligned(128)));
 #define fk_relax() ((void)0)
 #endif
 
+static long cpu_count(void);
+
 static void fk_init(u64* alc, u32 w) {
   if (pool_size < 2) {
     return;
   }
+  fk_cores = (u32)cpu_count();
   FkEnt* l = pool_mmap(1ull << 32);
   alc[FK_TOP]  = (u64)l;
   alc[FK_LOW]  = (u64)l;
@@ -7440,18 +7527,19 @@ static Term fk_take(Env e) {
   return 0;
 }
 
-// The thread's oldest unsplit frame below its newest (whose frame may not
-// be written yet) becomes a task, at most once per FK_GAP ns of a thread:
-// tasks too small to be worth a split would otherwise be split at every
-// fork while a drain's tail is hungry.
-#define FK_GAP 20000
+// The thread's oldest unsplit frame with FK_DEEP notes above it (the newest's
+// frame may not be written yet) becomes a task, at most once per FK_GAP ns
+// of a thread: tasks too small to be worth a split would otherwise be split
+// at every fork while a drain's tail is hungry.
+#define FK_GAP  20000
+#define FK_DEEP 4
 static u64 io_tick(void);
 
 FAR void fk_poll(Env e) {
   FkEnt* lo   = (FkEnt*)e.alc[FK_LOW];
   FkEnt* hi   = (FkEnt*)e.alc[FK_TOP] - 1;
   u64    bits = e.alc[FK_BITS];
-  if (lo >= hi || ~bits == 0 || err_seen(e.mem)) {
+  if (lo + FK_DEEP > hi || ~bits == 0 || err_seen(e.mem)) {
     return;
   }
   u64 now = io_tick();
@@ -7972,13 +8060,16 @@ static u32 pool_step(u32 rows) {
 
 static u32 pool_rows(Env e, DEV Term* stk) {
   u32 n = 0;
+  a32_add(&fk_busy, 1);
   for (;;) {
     u32 c    = a32_add(&pool_row, 1);
     u32 r    = c & 32767;
     u32 rows = c >> 15 & 255;
     u32 step = c >> 23 & 1 ? 1 : pool_step(rows);
     if (r >= rows * step) {
-      bool hunt = !(c >> 23 & 1) && e.alc[FK_TOP];
+      a32_sub(&fk_busy, 1);
+      bool hunt = !(c >> 23 & 1) && e.alc[FK_TOP]
+        && a32_load(&fk_hunters) + a32_load(&fk_busy) < fk_cores;
       if (hunt) {
         a32_add(&fk_hunters, 1);
       }
@@ -8147,11 +8238,17 @@ static MTLComputePipelineDescriptor* gpu_desc(void) {
   return d;
 }
 
+// A pipeline compiled into an archive alone is not kept in Metal's shader
+// cache, so the pipeline is made first: a rebuild of the same program then
+// reads it from the cache (0.04 s against 0.13-0.8 s), at no cost cold.
 static bool gpu_make(const char* path) {
   NSError* err = nil;
   id<MTLBinaryArchive> ar = [gpu_dev
     newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&err];
-  if (![ar addComputePipelineFunctionsWithDescriptor:gpu_desc() error:&err]) {
+  MTLComputePipelineDescriptor* d = gpu_desc();
+  if (![gpu_dev newComputePipelineStateWithDescriptor:d options:0
+      reflection:nil error:&err]
+    || ![ar addComputePipelineFunctionsWithDescriptor:d error:&err]) {
     gpu_fail(err);
   }
   return [ar serializeToURL:[NSURL fileURLWithPath:@(path)] error:&err];
