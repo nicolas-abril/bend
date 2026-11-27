@@ -7319,17 +7319,28 @@ static Term* pool_stack(void) {
   return (Term*)p;
 }
 
-// A wait yields a while before it sleeps, so a short turn pays no wake.
+// A wait yields up to b times (128 some 300us) before it sleeps, so a short
+// turn pays no wake. A worker's b adapts: a wait that slept halves it (down
+// to 4), one the yields ended doubles it (up to 128), so a program whose
+// turns come between long serial parts stops yielding through them.
 
-#define POOL_WAIT(c, cv) \
-  for (u32 s = 0; s < 128 && (c); s += 1) { \
-    sched_yield(); \
-  } \
-  pthread_mutex_lock(&pool_lock); \
-  while (c) { \
-    pthread_cond_wait(&cv, &pool_lock); \
-  } \
-  pthread_mutex_unlock(&pool_lock);
+#define POOL_WAIT(c, cv, b) \
+  { \
+    u32 s = 0; \
+    for (; s < (b) && (c); s += 1) { \
+      sched_yield(); \
+    } \
+    if (c) { \
+      (b) = (b) > 8 ? (b) >> 1 : 4; \
+      pthread_mutex_lock(&pool_lock); \
+      while (c) { \
+        pthread_cond_wait(&cv, &pool_lock); \
+      } \
+      pthread_mutex_unlock(&pool_lock); \
+    } else if (s != 0) { \
+      (b) = (b) < 64 ? (b) << 1 : 128; \
+    } \
+  }
 
 static u32 pool_step(u32 rows) {
   u32 per = rows * CUBE_T / (32 * pool_size);
@@ -7385,8 +7396,9 @@ static void* pool_work(void* arg) {
   Term* stk  = pool_stack();
   fk_init(ALC[(uintptr_t)arg], (u32)(uintptr_t)arg);
   u32   seen = 0;
+  u32   spin = 128;
   for (;;) {
-    POOL_WAIT(a32_load(&pool_row) >> 24 == seen, pool_wake)
+    POOL_WAIT(a32_load(&pool_row) >> 24 == seen, pool_wake, spin)
     seen = pool_rows((Env){ CORPUS, ALC[(uintptr_t)arg] }, stk);
   }
 }
@@ -7445,7 +7457,8 @@ OUTLINE void pool_turn(bool grow, u32 rows) {
   pthread_cond_broadcast(&pool_wake);
   pthread_mutex_unlock(&pool_lock);
   pool_rows((Env){ CORPUS, ALC[0] }, io_stk);
-  POOL_WAIT(a32_load_acq(&pool_done) != 0, pool_join)
+  u32 spin = 128;
+  POOL_WAIT(a32_load_acq(&pool_done) != 0, pool_join, spin)
   while (a32_load_acq(&fk_hunters) != 0) {
     fk_relax();
   }
