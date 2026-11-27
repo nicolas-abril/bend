@@ -3844,6 +3844,11 @@ const NV_ROUNDS = 64;
 
 const NV_LOW = 4;
 
+// Off: on collatz, the one Osprey kernel it reaches, the sequential port
+// ran 3.8% fewer cycles and the forked one 5.2% more (16-placement sweep),
+// at 20 to 30% more instructions (the turn count); see nv_sinks.
+const NV_SINK = false;
+
 const NV_BARE: Record<Name, string> = { "Nat.add": "($0 + $1)",
   "Nat.double": "($0 + $0)", "Nat.mul": "($0 * $1)" };
 
@@ -4339,7 +4344,7 @@ function nv_split(x: HTerm, m: Spine, cx: NvCx): Nv | null | undefined {
 function nv_sinks(k: Name, cx: NvCx, P: (Nv | null)[]): Map<number, number> {
   const out = new Map<number, number>();
   const n = fun_of(k).n;
-  for (let j = 0; j < n && cx.selfs.length >= 2 && !cx.clo; j++) {
+  for (let j = 0; j < n && NV_SINK && cx.selfs.length >= 2 && !cx.clo; j++) {
     const ss = cx.selfs.map((s) => s[j]);
     const gs = ss.filter((s) => s !== "same" && s?.how === "grow"
       && s.p === j) as NvStep[];
