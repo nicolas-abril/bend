@@ -97,7 +97,8 @@ type Iv = { lo: string; hi: string; p?: number; add?: number; sp?: number;
 type Ix = { forms: Map<number, Set<string>>; roles: string[] | null;
   info: Map<number, Iv>; conds: string[]; tmps: Map<string, string>;
   exs: Map<string, string>; outs: Map<string, Iv>; inl: number;
-  seen: boolean; lanes: Lane[]; wr?: boolean };
+  seen: boolean; lanes: Lane[]; wr?: boolean; arrs?: Set<number>;
+  rt?: boolean; stride?: boolean };
 
 // A countdown loop's lanes over an array (emit_lanes): the lane variable u,
 // the array words the turn hands b, b's result words that hold them, b's
@@ -2352,10 +2353,10 @@ function val_unbox(sc: Scope, v: Val, lay: Lay): Val {
 // ===
 
 function arr_cells(sc: Scope, l: string, at: string, el: Lay,
-  box: string): Val {
+  box: string, H = "e.mem"): Val {
   return val_new(emit_hold(sc, el.ks.map((k, j) => k === "box"
     ? box.replaceAll("$", `${l} + ${at} + ${j}`)
-    : `blk_read(e.mem, ${lay_arr(el).arr}, ${l}, ${at} + ${j})`), "c",
+    : `blk_read(${H}, ${lay_arr(el).arr}, ${l}, ${at} + ${j})`), "c",
   el.ks), el);
 }
 
@@ -2380,7 +2381,7 @@ function arr_loc(sc: Scope, a: string): string {
 }
 
 function arr_op(sc: Scope, k: string, el: Lay, args: Val[], T: HTerm,
-  steal = false, bare = false): Val {
+  steal = false, bare = false, via?: number): Val {
   const { arr, lgs } = lay_arr(el);
   if (k === "Array.new") {
     return val_new([arr_new(sc, args[0].ws[0], args[1], el)], BOX);
@@ -2395,13 +2396,15 @@ function arr_op(sc: Scope, k: string, el: Lay, args: Val[], T: HTerm,
   }
   const raw = bare || k === "Array.get_unchecked";
   const get = k.startsWith("Array.get");
-  const [l, at] = emit_hold(sc, [arr_loc(sc, a), raw
-    ? `((u32)${args[1].ws[0]} << ${lgs})`
-    : `blk_at(${a}, ${args[1].ws[0]}, ${lgs})`], "at");
+  // a loop array of words apart from the others (via): through its own base
+  const H = via === undefined ? "e.mem" : "B" + via;
+  const [l, at] = emit_hold(sc, [via === undefined ? arr_loc(sc, a) : "0",
+    raw ? `((u32)${args[1].ws[0]} << ${lgs})`
+      : `blk_at(${a}, ${args[1].ws[0]}, ${lgs})`], "at");
   const key = sc.def + "@" + FL.unit!.n++;
   const lend = get && !fact("type", "Array") && !fact("own", key);
   const got = arr_cells(sc, l, at, el, get && !lend ? "blk_keep(e, $)"
-    : "e.mem[$]");
+    : "e.mem[$]", H);
   const old = lend ? val_new(got.ws, el, el.ks.map(() => key)) : got;
   if (lend) {
     FL.unit!.lent.add(key);
@@ -2415,7 +2418,7 @@ function arr_op(sc: Scope, k: string, el: Lay, args: Val[], T: HTerm,
   if (!get) {
     arr_event(sc, [a]);
     val_own(val_to(sc, args[2], el)).forEach((w, j) => file_push(sc,
-      `blk_write(e.mem, ${arr}, ${l}, ${at} + ${j}, ${w});`));
+      `blk_write(${H}, ${arr}, ${l}, ${at} + ${j}, ${w});`));
     if (k !== "Array.swap") {
       if (!steal) {
         val_sink(sc, old);
@@ -3349,7 +3352,16 @@ function emit_native(sc: Scope, k: Name, to?: Name,
       ix.forms.clear();
       pass();
     }
-    const bare = seg.spin && !FL.js && ix_roles(ix, seg) ? pass() : seg;
+    let bare = seg.spin && !FL.js && ix_roles(ix, seg) ? pass() : seg;
+    // a loop that writes and reads two arrays or more (a block never
+    // moves, shared or not) emits its mask-free copy once more, each array
+    // of words through its own base: clang tells one base's cells from
+    // another's (and from the heap's) once told they are apart; not with a
+    // read along a stride, which clang would gather (syrk 1.15x the cycles)
+    if (bare !== seg && ix.wr && (ix.arrs?.size ?? 0) > 1 && !ix.stride) {
+      ix.rt = true;
+      bare = pass();
+    }
     FL.ix = null;
     for (const l of bare === seg ? [] : ix.lanes) {
       l.fid = name;
@@ -3369,6 +3381,14 @@ function emit_native(sc: Scope, k: Name, to?: Name,
     ix.conds.forEach(mark);
     const top = seg_text([...seg.ks.flatMap((kd, i) =>
       arr_q(kd) ? [`Term h${i} = r${i};`] : []), ...seg_take(seg)], 1);
+    // the routed copy runs when every two of its arrays' words are apart
+    // (a fork's handles are not): their bases are separate storage then
+    const rs = ix.rt ? [...ix.arrs!] : [];
+    const ps = rs.flatMap((x, i) => rs.slice(i + 1).map((y) => [x, y]));
+    ix.conds.length > 0 && ps.forEach(([x, y]) =>
+      ix.conds.push(`blk_apart(e.mem, r${x}, r${y})`));
+    const apart = [...rs.map((x) => `DEV u64* B${x} = blk_base(e.mem, r${x});`),
+      ...ps.map(([x, y]) => `BLK_APART(B${x}, B${y});`)];
     // The mask-free copy runs when the countdown allows IX_RUN steps and
     // every check holds; its checks are computed there, so a short loop
     // pays one test. One test of all the checks: a chain of && reads to
@@ -3378,8 +3398,9 @@ function emit_native(sc: Scope, k: Name, to?: Name,
       : [`  if (!DEVICE && r${ix.roles!.indexOf("down")} >= ${IX_RUN}) {`,
         ...seg_text([...ix.tmps].filter(([t]) => need.has(t)).map(([t, ex]) =>
           `u64 ${t} = ${ex};`), 2),
-        `    if (${[...new Set(ix.conds)].join("\n      & ")}) {`,
-        ...seg_text(top, 2), ...loop(bare, 3), "      return 1;", "    }", "  }",
+        `    if (${[...new Set(ix.conds)].map((c) => `(${c})`).join("\n      & ")}) {`,
+        ...seg_text(top, 2), ...seg_text(apart, 3), ...loop(bare, 3),
+        "      return 1;", "    }", "  }",
         ...top, ...loop(seg, 1), "  return 1;", "}"];
     // the device runs the masked copy alone: its length is the spin's
     const text = [...top, ...loop(seg, 1), "  return 1;", "}"].join("\n");
@@ -3527,7 +3548,12 @@ function ix_inl(sc: Scope, k: Name): boolean {
 // A helper's result word `to` takes w: it is what every w it takes is.
 function ix_out(sc: Scope, to: string, w: string): void {
   const outs = FL.ix!.outs;
-  const got = ix_word(sc, w);
+  // a word plus a constant: a counter a helper steps
+  const m = /^U32_BIN\((\w+), \+, (\d+)ull\)$/.exec(w);
+  const a = ix_word(sc, m?.[1] ?? w);
+  const got = !m || a.p === undefined || a.add! < 0 ? m ? IX_ANY : a : {
+    ...a.hi === IX_MAX ? IX_ANY : { lo: ix_sat(`${a.lo} + ${m[2]}`),
+      hi: ix_sat(`${a.hi} + ${m[2]}`) }, p: a.p, add: a.add! + Number(m[2]) };
   const old = outs.get(to) ?? got;
   outs.set(to, old.p === got.p && old.add === got.add
     ? { ...old.hi === got.hi && old.lo === got.lo ? got : IX_ANY,
@@ -3696,6 +3722,11 @@ function ix_site(sc: Scope, k: Name, m: Spine): boolean {
   if (FL.ix && sc.seg.native && /^Array\.(set|swap)$/.test(k)) {
     FL.ix.wr = true;
   }
+  const a = FL.ix?.roles && sc.seg.native && /^Array\.(get|set|swap)/.test(k)
+    ? iv(sc, m.args[0]).p : undefined;
+  if (a !== undefined && FL.ix!.roles![a] === "same") {
+    (FL.ix!.arrs ??= new Set()).add(a);
+  }
   if (!FL.ix?.roles || !sc.seg.native
     || !/^Array\.(get|set|swap)$/.test(k)) {
     return false;
@@ -3709,6 +3740,7 @@ function ix_site(sc: Scope, k: Name, m: Spine): boolean {
   // integer registers once the loop has two copies)
   const stride = FL.ix.wr && at.p !== undefined
     && /@/.test(FL.ix.roles[at.p]);
+  FL.ix.stride ||= stride;
   if (arr.p === undefined || FL.ix.roles[arr.p] !== "same"
     || at.hi === IX_MAX || stride) {
     return false;
@@ -3771,7 +3803,11 @@ function emit_intr(sc: Scope, k: Name, m: Spine, ty: HTerm | null): Val {
     facts_hot(sc.def, m.all[0], true);
   }
   if (C === null) {
-    return arr_op(sc, k, lay_el(m.all[0]), args, m.all[0], steal, bare);
+    const el = lay_el(m.all[0]);
+    const p = FL.ix?.rt && sc.seg.native && !el.ks.includes("box")
+      && /^Array\.(get|set|swap)/.test(k) ? iv(sc, m.args[0]).p : undefined;
+    return arr_op(sc, k, el, args, m.all[0], steal, bare,
+      p !== undefined && FL.ix!.arrs!.has(p) ? p : undefined);
   }
   const lays = fun_of(k).lays;
   const as = args.map((v, i) => val_own(val_to(sc, v, lays[i]))[0])
@@ -6215,6 +6251,30 @@ INLINE u32 blk_wcls(bool arr, u32 c) {
 INLINE u32 blk_span(Term t) {
   return blk_wcls(term_tag(t) == TAG_ARR, blk_cls(t));
 }
+
+INLINE bool blk_apart(DEV u64* H, Term a, Term b) {
+  u64 x = blk_loc(H, a), y = blk_loc(H, b);
+  return x + (1ull << blk_span(a)) <= y || y + (1ull << blk_span(b)) <= x;
+}
+
+// An array's own base: a pointer clang cannot trace back to the heap is its
+// own object, so its cells are told apart from another base's once told so
+#define BLK_APART(a, b)
+#if DEVICE
+#define blk_base(H, a) (H + blk_loc(H, a))
+#else
+INLINE u64* blk_base(u64* H, Term a) {
+  u64* p = H + blk_loc(H, a);
+  __asm__("" : "+r"(p));
+  return p;
+}
+#ifdef __has_builtin
+#if __has_builtin(__builtin_assume_separate_storage)
+#undef BLK_APART
+#define BLK_APART(a, b) __builtin_assume_separate_storage(a, b)
+#endif
+#endif
+#endif
 
 // A node is freed before its last live child, its spine swapped last. An end
 // over 255 goes in its trivial last cell. A node whose only box is its last
