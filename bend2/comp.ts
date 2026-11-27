@@ -4968,6 +4968,59 @@ function segs_fuse(segs: Seg[], dev: Set<string>): Seg[] {
   return out.length < segs.length ? segs_fuse(out, dev) : out;
 }
 
+// A grow runs what precedes a fork on few threads; where a def that forks
+// lazily reaches its leaf, an outer spin (one only segments call) whose step
+// runs a loop, a grow thread would run the whole leaf while the other
+// threads wait for the turn to end. So a grow defers the leaf: the segment
+// returns a task that reruns it in sequence (fk_defer), dealt to the next
+// drain like any task. The rerun must repeat what precedes the call, so
+// that is only matches and arithmetic on the segment's own words. The spin
+// and the code in sequence are as they were (Lazy forks).
+function leaf_defer(segs: Seg[], spins: Seg[], dev: Set<string>): void {
+  const forks = new Set(segs.filter((s) => s.lines.some((l) =>
+    l.includes("WL_FKNOTE("))).map((s) => s.def));
+  const calls = (ss: Seg[], f: string) => ss.some((s) => s.fid !== f
+    && s.lines.some((l) => l.includes(f + "(")));
+  const loops = (s: Seg) => s.lines.some((l) => /\bWL_SPIN\b/.test(l));
+  const inner = (s: Seg) => spins.filter((t) => t.fid !== s.fid
+    && s.lines.slice(1).some((l) => l.includes(t.fid + "(")));
+  const heavy = new Map<string, boolean>();
+  const runs = (s: Seg): boolean => heavy.get(s.fid) ?? (heavy.set(s.fid,
+    false), heavy.set(s.fid, loops(s) || inner(s).some(runs)).get(s.fid)!);
+  const leaves = new Set(spins.filter((s) => calls(segs, s.fid)
+    && !calls(spins, s.fid) && loops(s) && inner(s).some(runs))
+    .map((s) => s.fid));
+  const pure = (l: string) => /^(\} else )?if \(.*\) \{$|^\}( else \{)?$|^(Term|u32|u64) _\w+ = [^;]*;$/
+    .test(l.trim()) && [...l.matchAll(/\b(\w+)\(/g)].every(([, f]) =>
+    /^(U32_BIN|if|nat_\w+|u64|u32)$/.test(f));
+  for (const h of segs.filter((h) => forks.has(h.def) && !dev.has(h.fid)
+    && h.frame === null)) {
+    for (let i = 0; i < h.lines.length; i += 1) {
+      const m = h.lines[i].match(/^(\s*)Term (_o_\d+)\[\d+\];$/);
+      const c = h.lines[i + 1]?.match(/^\s*if \((spin_\w+)\(e, (_o_\d+), /);
+      if (!m || !c || c[2] !== m[2] || !leaves.has(c[1])
+        || !h.lines.slice(0, i).every(pure) || h.lines.slice(0, i).some((l) =>
+          h.params.some((p) => l.trim().startsWith(p + " = ")))) {
+        continue;
+      }
+      const lf = h.fid + "_lf";
+      h.lines.splice(i, 0, `${m[1]}if (!DEVICE && !seq) {`,
+        `${m[1]}  Term _lw[] = { ${h.params.join(", ") || 0} };`,
+        `${m[1]}  Term _lt = fk_defer(e, sp, ${lf}, _lw);`,
+        `${m[1]}  if (_lt != 0) {`, `${m[1]}    return _lt;`, `${m[1]}  }`,
+        `${m[1]}}`);
+      h.refs.add(lf);
+      // no ref back: a rerun in sequence forks no task, so its id is nofk
+      const seg = seg_new("", h.ret, h.ks.map((k, j) =>
+        val_new([`_lp_${j}`], { ks: [k], arms: null })));
+      seg.fid = lf;
+      seg.lines = ["seq |= 1;", `WL_JMP(${h.fid});`];
+      segs.push(seg);
+      break;
+    }
+  }
+}
+
 export function compile_book(book: Bend.Book): string {
   LANE_SITES = [];
   FL = file_new(main_pure(book), false);
@@ -4984,6 +5037,7 @@ export function compile_book(book: Bend.Book): string {
   const dev = reach([...[...FL.bangs].map(seg_fid), ...wide ? clos : []]);
   const segs = segs_fuse(all.filter((s) => !s.native && live.has(s.fid)), dev);
   const spins = all.filter((s) => s.native && live.has(s.fid));
+  leaf_defer(segs, spins, dev);
   lane_check(spins);
   segs_base(segs, dev);
   const tabs = c_header(segs, clos);
@@ -6631,6 +6685,26 @@ static u32 root_take(DEV u64* H, THR Term* v) {
   return n;
 }
 
+// A grow with idle threads (fewer rows than threads) defers a forking def's
+// leaf as a task that reruns its segment in sequence, up to FK_DEFER of them
+// a turn a thread: past that, leaves are many and small, and the grow runs
+// them as it would (leaf_defer).
+#if !DEVICE
+#define FK_DEFER 4
+static u32 fk_defers;
+static u32 fk_cap;
+OUTLINE Term fk_defer(Env e, DEV Term* sp, u32 fid, Term* w) {
+  if (a32_add(&fk_defers, 1) >= fk_cap) {
+    return 0;
+  }
+  u64 loc = task_node(e, fid, WL_CONT, WL_IDX, 0);
+  for (u32 i = 0; i < fid_arity(fid); i += 1) {
+    e.mem[loc + i] = w[i];
+  }
+  return term_tsk(fid, loc);
+}
+#endif
+
 // Spins
 // =====
 
@@ -7778,6 +7852,8 @@ static void cube_run(u64* H, bool gpu) {
     } else {
       u32 rows = f;
       u32 want = (pool_size - 1) / (CUBE_T / LINE) + 1;
+      a32_store(&fk_defers, 0);
+      fk_cap = f < pool_size ? FK_DEFER * pool_size : 0;
       if (f < want) {
         u32 cur = row_grow((Env){ H, ALC[0] }, io_stk, 0, CUBE_G, want, f);
         rows = cur > f ? cur : f;
