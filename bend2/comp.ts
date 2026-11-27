@@ -1571,10 +1571,11 @@ function def_fix(k: Name): boolean {
 // time, on the checker's evaluator (term_wnf) with CF_FUEL def unfoldings (CF_ALL in
 // a program), and becomes its value when that is a constant of at most
 // CF_SIZE nodes: Nats, U32s, strings and other constructors, no F32, no
-// function, no Array. A call whose one open argument calls a def that
-// answers a closed constant from every arm of its match (word(k) in
-// textstats) calls a copy of that def whose arms answer the outer call's
-// values (score(word(k)): one Nat an arm).
+// function, no Array. Nothing that reaches an @unsafe def is run: its
+// copies of an Array alias at run time (tests/run/array_lent). A call whose
+// one open argument calls a def that answers a closed constant from every
+// arm of its match (word(k) in textstats) calls a copy of that def whose
+// arms answer the outer call's values (score(word(k)): one Nat an arm).
 
 const CF_FUEL = 1 << 16;
 const CF_ALL = 1 << 22;
@@ -1640,7 +1641,7 @@ function cf_spine(t: any): { k: Name; xs: any[] } | null {
   }
   const d = s.$ === "Ref" && !s.b ? tld_of(s.k) : undefined;
   return d && done_live(d) && !def_foreign(d) && !(s.k in FL.made)
-    && d.x === 0 && xs.length === d.n ? { k: s.k, xs } : null;
+    && !d.u && d.x === 0 && xs.length === d.n ? { k: s.k, xs } : null;
 }
 
 // t's spine with argument j replaced by x, head by k and types' results by R
@@ -1720,10 +1721,11 @@ function cf_eval(t: any): any | null {
   const n = Math.min(CF_FUEL, FL.cffuel);
   let fuel = n;
   const tlds = new Proxy(FL.book.tlds, { get: (o, k) => {
-    if (--fuel < 0) {
+    const d = o[k as Name];
+    if (--fuel < 0 || (d?.$ === "Def" && d.u)) {
       throw CF_OUT;
     }
-    return o[k as Name];
+    return d;
   } });
   const book = { ...FL.book, tlds };
   const wnf = (y: HTerm): HTerm => term_strip(Bend.term_wnf(book, y));
