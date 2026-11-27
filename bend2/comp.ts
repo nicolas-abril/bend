@@ -1134,7 +1134,7 @@ function fun_of(k: Name): Fun {
       return { n: 0, h: null, live: [], lays: [BOX, BOX], ret: BOX };
     }
     const doms = tele_unbind(tld.T).doms;
-    const h = tld.e ? Bend.term_higher(tld.e) : null;
+    const h = FL.cfh.get(k) ?? (tld.e ? Bend.term_higher(tld.e) : null);
     const n = tld.n + (h === null ? 0
       : Math.min(def_raise(h, tld.n), doms.length - tld.n));
     const live = doms.slice(0, n).filter(dom_live);
@@ -1565,6 +1565,235 @@ function def_fix(k: Name): boolean {
   return true;
 }
 
+// Fold
+// ===
+
+// A call of a def on closed arguments (no variable in them) runs at compile
+// time, on the checker's evaluator (term_wnf) with CF_FUEL def unfoldings (CF_ALL in
+// a program), and becomes its value when that is a constant of at most
+// CF_SIZE nodes: Nats, U32s, strings and other constructors, no F32, no
+// function, no Array. Nothing that reaches an @unsafe def is run: its
+// copies of an Array alias at run time (tests/run/array_lent). A call whose
+// one open argument calls a def that answers a closed constant from every
+// arm of its match (word(k) in textstats) calls a copy of that def whose
+// arms answer the outer call's values (score(word(k)): one Nat an arm).
+
+const CF_FUEL = 1 << 16;
+const CF_ALL = 1 << 22;
+const CF_SIZE = 64;
+const CF_OUT = { lit: true };
+
+function cf_book(roots: Name[]): void {
+  const todo = [...roots];
+  const seen = new Set<Name>();
+  while (todo.length > 0) {
+    const k = todo.pop()!;
+    const tld = tld_of(k);
+    if (seen.has(k) || !done_live(tld) || def_foreign(tld) || !tld.e) {
+      seen.add(k);
+      continue;
+    }
+    seen.add(k);
+    const h = FL.funs.get(k)?.h ?? FL.cfh.get(k);
+    const e0 = h ? Bend.term_lower(h) : tld.e;
+    const e = cf_walk(e0);
+    if (e !== e0) {
+      FL.funs.has(k) ? fun_of(k).h = Bend.term_higher(e)
+        : FL.cfh.set(k, Bend.term_higher(e));
+    }
+    clo_vars(e, (y) => y.$ === "Ref" && todo.push(y.k));
+  }
+}
+
+// A def's body as fun_of would give it, without computing fun_of (its
+// layouts are read later, once the units are known).
+function cf_body(k: Name): HTerm {
+  const tld = tld_of(k) as Bend.Def;
+  return FL.funs.get(k)?.h ?? FL.cfh.get(k) ?? Bend.term_higher(tld.e!);
+}
+
+function cf_walk(t: any): any {
+  const r = t.$ === "Ann" ? cf_call(t) : null;
+  let out = r ?? t;
+  const put = (j: string, v: any) => {
+    if (v !== out[j]) {
+      out = out === t ? { ...t } : out;
+      out[j] = v;
+    }
+  };
+  for (const j of ["f", "x", "h", "m", "v"]) {
+    const y = out[j];
+    if (Array.isArray(y)) {
+      const vs = y.map(cf_walk);
+      vs.some((v, i) => v !== y[i]) && put(j, vs);
+    } else if (y && typeof y === "object" && y.$) {
+      put(j, cf_walk(y));
+    }
+  }
+  return out;
+}
+
+// A full call's head def and arguments, under its annotations.
+function cf_spine(t: any): { k: Name; xs: any[] } | null {
+  let s = t;
+  const xs: any[] = [];
+  for (; s.$ === "Ann" || s.$ === "App"; s = s.$ === "Ann" ? s.x : s.f) {
+    s.$ === "App" && xs.unshift(s.x);
+  }
+  const d = s.$ === "Ref" && !s.b ? tld_of(s.k) : undefined;
+  return d && done_live(d) && !def_foreign(d) && !(s.k in FL.made)
+    && !d.u && d.x === 0 && xs.length === d.n ? { k: s.k, xs } : null;
+}
+
+// t's spine with argument j replaced by x, head by k and types' results by R
+function cf_swap(t: any, j: number, x: any, k?: Name, R?: any): any {
+  const n = cf_spine(t)!.xs.length;
+  const go = (s: any, i: number, top: boolean): any => s.$ === "Ann"
+    ? Bend.Ann(go(s.x, i, false), R ? top ? R : cf_ret(s.T, R) : s.T, s.s)
+    : s.$ === "App" ? Bend.App(go(s.f, i - 1, false),
+      i === j ? x : s.x, s.s)
+    : k ? Bend.Ref(k, s.s) : s;
+  return go(t, n - 1, true);
+}
+
+function cf_ret(T: any, R: any): any {
+  return T.$ === "All" ? Bend.All(T.q, T.k, T.i, T.A, cf_ret(T.B, R), T.s) : R;
+}
+
+const cf_open = (t: any) => lt_any(t, (y) => y.$ === "Var");
+
+function cf_call(t: any): any | null {
+  const m = cf_spine(t);
+  if (m === null || lt_any(t.T, (y) => y.$ === "Var" || y.$ === "All"
+    || ((y.$ === "Ref" || y.$ === "ADT") && "IO F32 Array".split(" ")
+      .includes(y.k)))) {
+    return null;
+  }
+  const open = m.xs.flatMap((x, i) => cf_open(x) ? [i] : []);
+  if (open.length === 0) {
+    const v = cf_eval(t);
+    return v && Bend.Ann(v, t.T, t.s);
+  }
+  const g = open.length === 1 ? cf_spine(m.xs[open[0]]) : null;
+  const gd = g && tld_of(g.k) as Bend.Def;
+  if (!g || !gd!.e || def_raise(cf_body(g.k), gd!.n) !== 0) {
+    return null;
+  }
+  // g's body, each arm's closed answer a replaced by this call's value on a
+  const j = open[0];
+  const key = `${g.k}~${m.k}~${Bend.term_key(cf_swap(t, j, Bend.Ref("~")))}`;
+  let kf: Name | null | undefined = FL.cfk.get(key);
+  if (kf === undefined) {
+    let n = 0;
+    const arms = (s: any): any => {
+      const x = s.$ === "Ann" ? s.x : s;
+      if (s.$ === "Ann" && "Mat Lam Efq".includes(x.$)) {
+        const b = arms(x);
+        return b && Bend.Ann(b, cf_ret(s.T, t.T), s.s);
+      }
+      if (x.$ === "Mat") {
+        const [h, e] = [arms(x.h), arms(x.m)];
+        return h && e && Bend.Mat(x.k, h, e, x.s);
+      }
+      if (x.$ === "Lam") {
+        const b = arms(x.f);
+        return b && Bend.Lam(x.k, x.i, b, x.s, x.q);
+      }
+      if (x.$ === "Efq") {
+        return x;
+      }
+      const v = ++n <= 32 && !cf_open(s) ? cf_eval(cf_swap(t, j, s)) : null;
+      return v && Bend.Ann(v, t.T, s.s);
+    };
+    const e = arms(Bend.term_lower(cf_body(g.k)));
+    kf = e ? `${g.k}~lit${FL.cfk.size}` : null;
+    FL.cfk.set(key, kf);
+    if (e) {
+      FL.made[kf!] = { ...gd!, T: Bend.term_higher(cf_ret(Bend.term_lower(gd!.T),
+        t.T)), v: Bend.term_higher(e), e };
+    }
+  }
+  return kf && cf_swap(m.xs[j], -1, null, kf, t.T);
+}
+
+// A closed call's value, as a constant term, or null. Only what is read is
+// evaluated, one weak head at a time, so a shared result is not expanded.
+function cf_eval(t: any): any | null {
+  const n = Math.min(CF_FUEL, FL.cffuel);
+  let fuel = n;
+  const tlds = new Proxy(FL.book.tlds, { get: (o, k) => {
+    const d = o[k as Name];
+    if (--fuel < 0 || (d?.$ === "Def" && d.u)) {
+      throw CF_OUT;
+    }
+    return d;
+  } });
+  const book = { ...FL.book, tlds };
+  const wnf = (y: HTerm): HTerm => term_strip(Bend.term_wnf(book, y));
+  let size = 0;
+  const u32 = (y: HTerm): number | null => {
+    const s = wnf(y);
+    if (s.$ === "Lit" || s.$ !== "Ctr" || s.k !== "U32") {
+      return s.$ === "Lit" && s.k === "U32" ? s.v : null;
+    }
+    let [w, v] = [wnf(s.x[0]), 0];
+    for (let i = 0; i < 32; i++, w = wnf(w.x[1])) {
+      const b = w.$ === "Ctr" && w.k === "WCon" ? wnf(w.x[0]) : null;
+      if (b?.$ !== "Ctr" || (b.k !== "True" && b.k !== "False")) {
+        return null;
+      }
+      v += b.k === "True" ? 2 ** i : 0;
+    }
+    return w.$ === "Ctr" && w.k === "WNil" ? v : null;
+  };
+  const go = (y: HTerm): any => {
+    let s = wnf(y);
+    if (++size > CF_SIZE || s.$ === "Lit") {
+      return s.$ === "Lit" && s.k !== "F32" ? s : null;
+    }
+    if (s.$ !== "Ctr" || s.k === "F32") {
+      return null;
+    }
+    if (s.k === "U32") {
+      const v = u32(s);
+      return v === null ? null : Bend.Lit("U32", v);
+    }
+    if (s.k === "Succ" || s.k === "Zero") {
+      let k = 0;
+      for (; s.$ === "Ctr" && s.k === "Succ"; s = wnf(s.x[0])) {
+        k++;
+      }
+      k += s.$ === "Lit" && s.k === "Nat" ? s.v : 0;
+      return (s.$ === "Lit" && s.k === "Nat") || (s.$ === "Ctr" && s.k === "Zero")
+        ? k < 2 ** 48 ? Bend.Lit("Nat", k) : null : null;
+    }
+    if (s.k === "SCon" || s.k === "SNil") {
+      const cs: number[] = [];
+      for (; s.$ === "Ctr" && s.k === "SCon"; s = wnf(s.x[1])) {
+        const c = wnf(s.x[0]);
+        const u = c.$ === "Ctr" && c.k === "Chr" ? u32(c.x[0]) : null;
+        if (u === null || cs.length > 4 * CF_SIZE) {
+          return null;
+        }
+        cs.push(u);
+      }
+      const tail = s.$ === "Lit" && s.k === "String" ? [...s.v].map((c) =>
+        c.codePointAt(0)!) : s.$ === "Ctr" && s.k === "SNil" ? [] : null;
+      return tail && cs.length + tail.length <= 4 * CF_SIZE
+        ? Bend.lit_of([...cs, ...tail]) : null;
+    }
+    const xs = s.x.map(go);
+    return xs.every((x) => x) ? Bend.Ctr(s.k, xs) : null;
+  };
+  try {
+    return go(Bend.term_higher(t));
+  } catch (x) {
+    return null;
+  } finally {
+    FL.cffuel -= n - Math.max(fuel, 0);
+  }
+}
+
 // Clo
 // ===
 
@@ -1900,6 +2129,9 @@ function file_new(book: Bend.Book, js: boolean) {
     inner: new Set<Name>(),
     nests: new Map<Name, number>(),
     made: Object.create(null) as Record<Name, Bend.Def>,
+    cfk: new Map<string, Name | null>(),
+    cffuel: CF_ALL,
+    cfh: new Map<Name, HTerm>(),
     clos: new Map<Name, Map<string, Name | null>>(),
     clo_of: new Map<Name, { k: Name; n: number }>(),
     trees: new Map<Name, boolean>(),
@@ -5751,6 +5983,7 @@ export function compile_book(book: Bend.Book): string {
   LANE_SITES = [];
   FL = file_new(main_pure(book), false);
   clo_book(["main"]);
+  cf_book(["main"]);
   file_book(["main", ...RUNTIME_ADTS]);
   nv_book();
   const us = c_units();
@@ -8068,6 +8301,14 @@ static void* pool_mmap(u64 bytes) {
   return p;
 }
 
+// A thread's allocator counts start at ALC_NONE: each thread sets its own row
+// when it starts, so a run touches the rows of the threads it has.
+static void alc_open(u64* alc) {
+  for (u32 c = 0; c < NCLS_ALL; c += 1) {
+    alc[NCLS_ALL + c] = ALC_NONE;
+  }
+}
+
 static Term* pool_stack(void) {
   u64   len = 1ull << 31;
   u64   alt = 4 * SIGSTKSZ;
@@ -8159,6 +8400,7 @@ static u32 pool_rows(Env e, DEV Term* stk) {
 
 static void* pool_work(void* arg) {
   Term* stk  = pool_stack();
+  alc_open(ALC[(uintptr_t)arg]);
   fk_init(ALC[(uintptr_t)arg], (u32)(uintptr_t)arg);
   u32   seen = 0;
   u32   spin = 128;
@@ -8174,6 +8416,7 @@ OUTLINE void pool_open(void) {
     return;
   }
   up = true;
+  fk_init(ALC[0], 0);
   for (u32 w = 1; w < pool_size; w += 1) {
     pthread_t tid;
     if (pthread_create(&tid, NULL, pool_work, (void*)(uintptr_t)w)) {
@@ -8699,9 +8942,7 @@ static bool corpus_grow(u64* H, u64 need) {
 static u64* corpus_setup(bool gpu, long threads, u64 bytes) {
   io_gpu     = gpu;
   KEEP_WORDS = gpu ? CHUNK : CAP_WORDS;
-  for (u32 i = 0; i < CUBE_T * NCLS_ALL; i += 1) {
-    ALC[i / NCLS_ALL][NCLS_ALL + i % NCLS_ALL] = ALC_NONE;
-  }
+  alc_open(ALC[0]);
   u64 size   = (!gpu ? 1ull << 33 : bytes != 0 ? bytes : gpu_span())
     & ~16383ull;
   CORPUS     = gpu ? gpu_map(size) : corpus_map(size);
@@ -9087,6 +9328,10 @@ static Term io_work(IoWork* w, IoCall call, IoPack pack) {
   w->pack  = pack;
   io_busy += 1;
   if (io_busy > io_size && io_size < IO_HELP) {
+    if (io_size == 0 && (pipe(io_wake_fd)
+      || fcntl(io_wake_fd[0], F_SETFL, O_NONBLOCK))) {
+      err_fail("the event loop failed to open");
+    }
     pthread_t tid;
     if (pthread_create(&tid, NULL, io_help, NULL)) {
       err_fail("pthread_create");
@@ -9108,7 +9353,7 @@ static bool io_bit(u8* set, int fd, bool put) {
 }
 
 static void io_wait(Env e, bool block) {
-  int top  = io_wake_fd[0];
+  int top  = io_size != 0 ? io_wake_fd[0] : 0;
   u64 soon = io_park != NULL ? io_park->next->time : 0;
   io_parked(a) {
     if (a->evts != 0 && (int)a->word > top) {
@@ -9117,7 +9362,7 @@ static void io_wait(Env e, bool block) {
   }
   u64 len = (u64)top / 64 * 8 + 8;
   u8* set = io_mem(calloc(2, len));
-  io_bit(set, io_wake_fd[0], true);
+  io_bit(set, io_wake_fd[0], io_size != 0);
   io_parked(a) {
     if (a->evts != 0) {
       io_bit(set + (a->evts == POLLOUT) * len, (int)a->word, true);
@@ -9134,7 +9379,7 @@ static void io_wait(Env e, bool block) {
     }
     memset(set, 0, 2 * len);
   }
-  if (io_bit(set, io_wake_fd[0], false)) {
+  if (io_size != 0 && io_bit(set, io_wake_fd[0], false)) {
     io_take(e);
   }
   u64     now  = io_tick();
@@ -9248,11 +9493,7 @@ static void io_step(Env e, IoWork* a) {
 OUTLINE void io_loop(u64* H) {
   Env e = { H, ALC[0] };
   io_stk = pool_stack();
-  fk_init(ALC[0], 0);
   signal(SIGPIPE, SIG_IGN);
-  if (pipe(io_wake_fd) || fcntl(io_wake_fd[0], F_SETFL, O_NONBLOCK)) {
-    err_fail("the event loop failed to open");
-  }
   Term m = corpus_eval(H, term_tsk(MAIN_FID, task_node(e, MAIN_FID,
     TERM_HOLE, 0, 0)));
   io_spawn(m);
