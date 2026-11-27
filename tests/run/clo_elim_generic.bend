@@ -3,7 +3,8 @@
 # delaunay-animation's LZW coder in its closure spelling. Each copy's types
 # must be its own: a type held in a cell names its def's levels, and a
 # U32 read as a box does not build. Also a copy whose call fills k's erased
-# type arguments, and lambdas nested three deep.
+# type arguments, and lambdas nested three deep. The table is full at code
+# 290, so 60 items clear it once and the interpreter takes 2 s, not 84.
 import Base
 
 @unsafe
@@ -55,7 +56,7 @@ def lz.miss(full: Bool, q: Nat, +i: U32, +cur: U32, +x: U32, +nc: U32, +o: U32, 
   match full:
     case True{}:
       LZ{idx, hd, ix, nx, out} = s
-      lz.loop(q, (i + 1 : U32), x, 258, (o + 2 : U32), LZ{idx, lz.clear(4096n, 0, hd), ix, nx, (out[o] <- cur)[(o + 1 : U32)] <- 256})
+      lz.loop(q, (i + 1 : U32), x, 258, (o + 2 : U32), LZ{idx, lz.clear(512n, 0, hd), ix, nx, (out[o] <- cur)[(o + 1 : U32)] <- 256})
     case False{}:
       LZ{idx, hd, ix, nx, out} = s
       pair.go(Array<U32>, U32, LZ & U32, hd[cur], hd2 => +old =>
@@ -65,7 +66,7 @@ def lz.miss(full: Bool, q: Nat, +i: U32, +cur: U32, +x: U32, +nc: U32, +o: U32, 
 def lz.hit.go(miss: Bool, q: Nat, +i: U32, +cur: U32, +x: U32, +e: U32, +nc: U32, +o: U32, s: LZ) -> LZ & U32:
   match miss:
     case True{}:
-      lz.miss(U32.is_eq(nc, 4095), q, i, cur, x, nc, o, s)
+      lz.miss(U32.is_eq(nc, 290), q, i, cur, x, nc, o, s)
     case False{}:
       lz.loop(q, (i + 1 : U32), e, nc, o, s)
 
@@ -84,7 +85,7 @@ def lz.loop(k: Nat, +i: U32, +cur: U32, +nc: U32, +o: U32, s: LZ) -> LZ & U32:
 # the codes of pp color indices: the codes array and their number
 @unsafe
 def lz.stream(+pp: U32, idx: Array<U32>) -> Array<U32> & U32:
-  pair.go(Array<U32>, U32, Array<U32> & U32, idx[0], i2 => +c0 => lz.out(lz.loop(U32.to_nat((pp - 1 : U32)), 1, c0, 258, 1, LZ{i2, Array.new(U32, 12n, 0), Array.new(U32, 12n, 0), Array.new(U32, 12n, 0), Array.set(U32, Array.new(U32, depth((pp + pp / 1000 + 16 : U32)), 0), 0, 256)})))
+  pair.go(Array<U32>, U32, Array<U32> & U32, idx[0], i2 => +c0 => lz.out(lz.loop(U32.to_nat((pp - 1 : U32)), 1, c0, 258, 1, LZ{i2, Array.new(U32, 9n, 0), Array.new(U32, 9n, 0), Array.new(U32, 9n, 0), Array.set(U32, Array.new(U32, depth((pp + pp / 1000 + 16 : U32)), 0), 0, 256)})))
 
 def lz.out(r: LZ & U32) -> Array<U32> & U32:
   (s, +n) = r
@@ -111,6 +112,6 @@ def fin(r: Array<U32> & U32) -> U32:
   (sum(100n, 0, 0, a) + n : U32)
 
 def main() -> U32:
-  fin(lz.stream(5000, fill(5000n, 0, Array.new(U32, 13n, 0))))
+  fin(lz.stream(60, fill(60n, 0, Array.new(U32, 6n, 0))))
 
-#|191337777
+#|785734404

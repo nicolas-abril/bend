@@ -62,7 +62,10 @@ def both(+d: Nat, +i: U32) -> U32:
       t xs = graft(i) cnt(i)
       (one(i, t, xs) + both(p, (i + 1 : U32)) : U32)
 
-def main() -> U32:
+def run() -> U32:
   both(40n, 1)
+
+def main() -> IO(Unit):
+  IO.print(U32.show(run()))
 
 #|3710164780

@@ -33,7 +33,10 @@ def items.go(one: Bool, +lo: U32, +hi: U32) -> U32:
       (a + b : U32)
 
 @unsafe
-def main() -> U32:
+def run() -> U32:
   items(0, 16)
+
+def main() -> IO(Unit):
+  IO.print(U32.show(run()))
 
 #|322923265

@@ -31,7 +31,10 @@ def fin(r: Array<U32> & U32) -> U32:
   x
 
 @unsafe
-def main() -> U32:
+def run() -> U32:
   fin(q(14n, 1, Array.new(U32, 12n, 3)))
+
+def main() -> IO(Unit):
+  IO.print(U32.show(run()))
 
 #|3892109312
