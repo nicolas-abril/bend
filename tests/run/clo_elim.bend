@@ -5,7 +5,8 @@
 # returns, a lambda the def stores in a node, a recursion that passes its
 # lambda on unchanged, a recursion through the lambda's own body, and a
 # recursion that wraps its lambda in a new one each step (left a closure
-# past one copy). Inputs come from a list built at run time.
+# past one copy). Inputs come from a list built at run time; main prints
+# through IO, as the checker's normal form leaves F32.to_u32(2.5) stuck.
 import Base
 
 type Tree is Data:
@@ -114,8 +115,8 @@ def run(+k: U32, +xs: +List<U32>) -> String:
   +r9 = loop(1000n, k, 1)
   show(r1) ++ " " ++ show(r2) ++ " " ++ show(r3) ++ " " ++ show(r4) ++ " " ++ show(r5) ++ " " ++ show(r6) ++ " " ++ show(r7) ++ " " ++ show(r8) ++ " " ++ show(r9)
 
-def main() -> String:
+def main() -> IO(Unit):
   +xs : +List<U32> = [3, 1, 4, 1, 5]
-  run(len(xs), xs)
+  IO.print(run(len(xs), xs))
 
-#|"119 64 170 40 15 15 1388 132 20001"
+#|119 64 170 40 15 15 1388 132 20001
