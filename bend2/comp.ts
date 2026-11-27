@@ -3842,8 +3842,6 @@ const NV_TOP: Nv = [0, NAT_MAX];
 
 const NV_ROUNDS = 64;
 
-const NV_LOW = 4;
-
 // Off: on collatz, the one Osprey kernel it reaches, the sequential port
 // ran 3.8% fewer cycles and the forked one 5.2% more (16-placement sweep),
 // at 20 to 30% more instructions (the turn count); see nv_sinks.
@@ -3865,13 +3863,11 @@ function nv_join(a: Nv | null, b: Nv | null): Nv | null {
 }
 
 // old joined with got, after n walks: a bound that keeps moving goes to
-// its end after NV_ROUNDS (a Newton step takes a walk per bit to settle),
-// or a low one after low (a countdown takes it a step a walk).
-function nv_widen(old: Nv | null, got: Nv | null, n: number,
-  low = NV_ROUNDS): Nv | null {
+// its end after NV_ROUNDS (a Newton step takes a walk per bit to settle).
+function nv_widen(old: Nv | null, got: Nv | null, n: number): Nv | null {
   const v = nv_join(old, got);
-  return old === null || v === null ? v : [v[0] < old[0] && n > low ? 0
-    : v[0], v[1] > old[1] && n > NV_ROUNDS ? NAT_MAX : v[1]];
+  return old === null || v === null || n <= NV_ROUNDS ? v
+    : [v[0] < old[0] ? 0 : v[0], v[1] > old[1] ? NAT_MAX : v[1]];
 }
 
 function nv_same(a: Nv | null, b: Nv | null): boolean {
@@ -4086,11 +4082,13 @@ function nv_def(k: Name): void {
   }
   // the turns of the loop the self-calls make, if a parameter steps down
   let T = cx.selfs.length === 0 ? 0 : Infinity;
+  const down = new Set<number>();
   for (let j = 0; j < f.n; j++) {
     const ss = cx.selfs.map((s) => s[j]);
     const hi = E[j]![1];
     if (cx.selfs.length > 0 && ss.every((s) => s !== null && s !== "same"
       && s.p === j && s.how !== "grow")) {
+      down.add(j);
       T = Math.min(T, ss.every((s) => (s as NvStep).how === "div")
         ? (hi >= 1 ? Math.floor(Math.log2(hi)) + 1 : 0) : hi);
     }
@@ -4104,9 +4102,8 @@ function nv_def(k: Name): void {
     const got = T < Infinity && grow
       ? nv_cap(E[j]![0], E[j]![1] + T * B)
       : cx.vs.reduce((a, vs) => nv_join(a, vs[j]), E[j]);
-    // a low bound the loop itself takes down goes soon
-    return nv_widen(old, got, walks, got && got[0] < E[j]![0] ? NV_LOW
-      : NV_ROUNDS);
+    // a parameter the loop steps down goes down to 0
+    return nv_widen(old, got && down.has(j) ? [0, got[1]] : got, walks);
   });
   st.sink.set(k, nv_sinks(k, cx, P2));
   if (P2.some((v, j) => !nv_same(v, P[j]))) {
