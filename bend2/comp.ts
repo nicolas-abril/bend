@@ -4678,10 +4678,58 @@ function set_run(sc: Scope, m: Spine): Val | null {
   return val_new([a], BOX);
 }
 
+// A funnel, (lo >> s) | ((hi << 1) << (31 - s)) or with the << 1 outside,
+// and s and 31 - s both maybe & 31: [lo, hi, both amounts]
+function funnel(m: Spine): HTerm[] | null {
+  const sp = (t: HTerm, k: string) => {
+    const q = term_spine(term_strip(t));
+    return q.t.$ === "Ref" && q.t.k === k ? q.args : null;
+  };
+  const lit = (t: HTerm, v: number) => Bend.u32_from_term(term_strip(t)) === v;
+  const by1 = (t: HTerm) => {
+    const a = sp(t, "U32.shln");
+    return a && nat_peel(a[1]).join() === ",1" ? a[0] : null;
+  };
+  const un = (t: HTerm): [HTerm, boolean] => {
+    const a = sp(t, "U32.and");
+    return a && lit(a[1], 31) ? [term_strip(a[0]), true] : [term_strip(t), false];
+  };
+  for (const [a, b] of [m.args, [...m.args].reverse()]) {
+    const A = sp(a, "U32.shrn");
+    const B = sp(b, "U32.shln");
+    const h = B && by1(B[0]);
+    const x = by1(b);
+    for (const [hi, t] of [h ? [h, B![1]] : [], x && sp(x, "U32.shln") || []]) {
+      const s = A && sp(A[1], "U32.to_nat");
+      const d = t ? sp(t, "U32.to_nat") : null;
+      if (!s || !d) continue;
+      const [v, mv] = un(s[0]);
+      const [w, mw] = un(d[0]);
+      const D = sp(w, "U32.sub");
+      const r = D && term_strip(D[1]);
+      if (v.$ === "Var" && mv === mw && D && lit(D[0], 31)
+        && r?.$ === "Var" && r.k === v.k && r.i === v.i) {
+        return [A![0], hi, A![1], t];
+      }
+    }
+  }
+  return null;
+}
+
 function emit_intr(sc: Scope, k: Name, m: Spine, ty: HTerm | null): Val {
   const run = k === "Array.set" ? set_run(sc, m) : null;
   if (run) {
     return run;
+  }
+  const fun = k === "U32.or" && !FL.js ? funnel(m) : null;
+  if (fun) {
+    // the second amount holds the same s: emitted for its use only
+    const as = emit_each(sc, fun).slice(0, 3).map((v, i) => {
+      const w = val_own(val_to(sc, v,
+        fun_of(i < 2 ? "U32.or" : "U32.shrn").lays[i ? 1 : 0]))[0];
+      return op_bare(fun[i]) ? w : emit_alias(sc, w, "a");
+    });
+    return val_new([`U32_FUN(${as.join(", ")})`], lay_of(ty));
   }
   const steal = k === "Array.set" && place_take(sc, m.args.map(term_strip));
   const bare = ix_site(sc, k, m);
@@ -6899,6 +6947,16 @@ ${SHIMS}
 #endif
 
 #define U32_BIN(a, o, b) ((u64)((u32)(a) o (u32)(b)))
+// b:a >> s's low word (0 from s = 32): one 64-bit shift, one load when a
+// and b are a word pair (a constant s keeps the word funnel: one extr)
+#if DEVICE
+#define U32_K(s) 0
+#else
+#define U32_K(s) __builtin_constant_p(s)
+#endif
+#define U32_FUN(a, b, s) ((u32)(s) >= 32 ? 0ull : U32_K(s) \
+  ? (u64)((u32)(a) >> (u32)(s) | (u32)(b) << 1 << (31 - (u32)(s))) \
+  : (u64)(u32)(((u64)(u32)(b) << 32 | (u32)(a)) >> (u32)(s)))
 
 INLINE u64 u32_pow(u32 a, u64 n) {
   u32 r = 1;
