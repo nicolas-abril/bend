@@ -131,7 +131,8 @@ type Fun = { n: number; h: HTerm | null; live: Dom[]; lays: Lay[]; ret: Lay };
 // terms, its callees' included, is inlined there (HOT): clang would call it;
 // so is a call, in a loop or a def a loop calls, to a spin that loops or
 // calls one (nest_of): clang calls tar's chain walk, at 1.4x the cycles;
-// a node past WIDE pads to its size class.
+// but not one that would grow its caller, inlined HOT callees included, past
+// HOT_MAX lines (hot_cap); a node past WIDE pads to its size class.
 
 const CLO_APPLY = "Clo~apply";
 
@@ -144,6 +145,8 @@ const ROWS = new Map<string, (...xs: unknown[]) => Cell>();
 const SPIN_FAR = 8192;
 
 const HOT_SIZE = 1024;
+
+const HOT_MAX = 16384;
 
 const BASE_MAX = 8;
 
@@ -3047,6 +3050,28 @@ function emit_spin(sc: Scope, ck: Spine): Val {
   return out;
 }
 
+// A HOT call has clang inline its spin with the spin's own HOT calls, so
+// nested sites multiply: kostya/json's number parser grew to 47M lines,
+// past clang's memory. Each segment keeps its HOT calls, in order, while
+// its lines with theirs inlined stay within HOT_MAX (a cycle inlines none).
+function hot_cap(segs: Seg[]): void {
+  const by = new Map(segs.map((s) => [s.fid, s]));
+  const size = new Map<string, number>();
+  const grow = (s: Seg): number => memo(size, s.fid, () => {
+    size.set(s.fid, Infinity);
+    let n = 0;
+    s.lines = s.lines.map((x) => {
+      const c = /^\s*HOT if \((\w+)\(/.exec(x)?.[1];
+      const k = c === undefined ? 0 : by.has(c) ? grow(by.get(c)!) : 0;
+      const keep = n + k <= HOT_MAX;
+      n += x.split("\n").length + (keep ? k : 0);
+      return keep ? x : x.replace("HOT ", "");
+    });
+    return n;
+  });
+  segs.forEach(grow);
+}
+
 // Whether k, or a def it calls, loops (1) or does F32 math (2: SLP
 // misjudges it inlined).
 function nest_of(k: Name): number {
@@ -4935,6 +4960,7 @@ export function compile_book(book: Bend.Book): string {
   const spins = all.filter((s) => s.native && live.has(s.fid));
   lane_check(spins);
   segs_base(segs, dev);
+  hot_cap([...spins, ...segs]);
   const tabs = c_header(segs, clos);
   // a spin may call one defined after it
   const img = [`CONSTV u64 STAT_IMG[] = { ${FL.img.join(", ") || 0} };`,
