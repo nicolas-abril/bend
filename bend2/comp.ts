@@ -1022,6 +1022,8 @@ function mat_lits(x: HTerm, k: Name, self: HTerm): Row[] {
 function arm_self(arm: HTerm, n: number, self: HTerm,
   back: (ps: HTerm[]) => HTerm, box?: (j: number) => boolean): [HTerm, number] {
   const ps: Of<"Var">[] = [];
+  // ps only grows, so back's node is built once per length
+  let bk = self, bn = 0;
   const go = (t: HTerm, top: boolean): HTerm => {
     const s = Bend.term_force(t);
     const lam = s.$ === "Lam";
@@ -1029,7 +1031,8 @@ function arm_self(arm: HTerm, n: number, self: HTerm,
     if (term_const(s)) {
       return s;
     }
-    if (s.$ === "Ctr" && ps.length && term_same(s, back(ps))) {
+    if (s.$ === "Ctr" && ps.length && term_same(s, bn === ps.length ? bk
+      : (bn = ps.length, bk = back(ps)))) {
       return self;
     }
     if (lam || s.$ === "Let") {
@@ -2116,6 +2119,13 @@ function arg_key(k: Name, i: number): string {
   return k + "~" + i;
 }
 
+// A unit's emission builds terms (instantiated arms, arm_self's copies) that
+// die with it, but a memo keyed by a term keeps them: the memos whose values
+// hold terms or probes are weak, and the pure ones over MEMO_MAX entries
+// (ground, uses, spines; as WeakMaps, millions of entries slow each GC) are
+// cleared when a unit starts.
+const MEMO_MAX = 1 << 18;
+
 function file_new(book: Bend.Book, js: boolean) {
   PROBES.length = 1;
   return {
@@ -2140,7 +2150,7 @@ function file_new(book: Bend.Book, js: boolean) {
     packs: new Map<Name, { n: number; at: number[][] } | null>(),
     fixed: new Set<Name>(),
     lays: new Map<string, Lay>(),
-    teles: new Map<HTerm, { doms: Dom[]; ret: HTerm }>(),
+    teles: new WeakMap<HTerm, { doms: Dom[]; ret: HTerm }>(),
     keys: new WeakMap<HTerm, string>(),
     ids: new Map<string, string>(),
     taken: new Set("FID_EXIT FID_ENTER FID_T CID_T $pc".split(" ")),
@@ -2159,11 +2169,11 @@ function file_new(book: Bend.Book, js: boolean) {
     unit: null as Unit | null,
     tabs: new Map<string, number>(),
     lits: new Map<string, number>(),
-    consts: new Map<Lay, Map<HTerm, Val>>(),
+    consts: new Map<Lay, WeakMap<HTerm, Val>>(),
     img: [] as string[],
     tails: new Map<Name, Set<Name>>(),
     entries: new Set<Name>(),
-    opens: new Map<Of<"Lam"> | Of<"Let">, Open>(),
+    opens: new WeakMap<Of<"Lam"> | Of<"Let">, Open>(),
     uses: new Map<HTerm, Bend.PMap<number>>(),
     folds: new Map<HTerm, HTerm | null>(),
     deeps: new Map<HTerm, HTerm | null>(),
@@ -2178,8 +2188,8 @@ function file_new(book: Bend.Book, js: boolean) {
     effs: new Map<string, [string, string]>(),
     hold: new Map<string, boolean>(),
     cnts: new Map<Name, number[]>(),
-    cols: new Map<HTerm, Map<string, Cols>>(),
-    etas: new Map<HTerm, [HTerm, HTerm | null][]>(),
+    cols: new WeakMap<HTerm, Map<string, Cols>>(),
+    etas: new WeakMap<HTerm, [HTerm, HTerm | null][]>(),
     dst: false,
   };
 }
@@ -2810,6 +2820,8 @@ function unit_new(name: string, emit: () => void): Unit {
 }
 
 function unit_emit(u: Unit): void {
+  [FL.ground, FL.uses, FL.spines].forEach((m: Map<HTerm, unknown>) =>
+    m.size > MEMO_MAX && m.clear());
   FL.folds.clear();
   FL.deeps.clear();
   FL.spent.clear();
@@ -4764,7 +4776,7 @@ function emit_ctr(sc: Scope, x: Of<"Ctr">, ty: HTerm | null,
     fact_when("ctr", x.k, () => facts_ctr(d, ctr, adt.x));
   }
   const pos = at ?? lay_of(adt);
-  const seen = memo(FL.consts, pos, () => new Map<HTerm, Val>());
+  const seen = memo(FL.consts, pos, () => new WeakMap<HTerm, Val>());
   if (seen.has(x)) {
     return seen.get(x)!;
   }
