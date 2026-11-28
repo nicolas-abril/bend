@@ -1580,8 +1580,13 @@ function def_fix(k: Name): boolean {
 // one open argument calls a def that answers a closed constant from every
 // arm of its match (word(k) in textstats) calls a copy of that def whose
 // arms answer the outer call's values (score(word(k)): one Nat an arm).
+// An unfolding copies its def's body, so a call also stops past CF_NODES
+// body nodes: kmeans' U32.show(rbatch!(..)), the whole benchmark, copied 72M
+// in 0.8 s (1.2 GB) before its fuel ran out; the most a value folded took is
+// 3.3M (tests/compile/record_wide_boxed_params), 1.2M in the benchmarks.
 
 const CF_FUEL = 1 << 16;
+const CF_NODES = 1 << 23;
 const CF_ALL = 1 << 22;
 const CF_SIZE = 64;
 const CF_OUT = { lit: true };
@@ -1634,6 +1639,23 @@ function cf_walk(t: any): any {
     }
   }
   return out;
+}
+
+// The nodes of a def's body, each once, types aside.
+function cf_nodes(d: Bend.Def): number {
+  return memo(FL.cfn, d, () => {
+    const seen = new Set<object>();
+    const go = (t: any): void => {
+      if (t && typeof t === "object" && !seen.has(t)) {
+        seen.add(t);
+        for (const j in t) {
+          j !== "s" && j !== "T" && go(t[j]);
+        }
+      }
+    };
+    go(d.e);
+    return seen.size;
+  });
 }
 
 // A full call's head def and arguments, under its annotations.
@@ -1723,10 +1745,10 @@ function cf_call(t: any): any | null {
 // evaluated, one weak head at a time, so a shared result is not expanded.
 function cf_eval(t: any): any | null {
   const n = Math.min(CF_FUEL, FL.cffuel);
-  let fuel = n;
+  let fuel = n, nodes = CF_NODES;
   const tlds = new Proxy(FL.book.tlds, { get: (o, k) => {
     const d = o[k as Name];
-    if (--fuel < 0 || (d?.$ === "Def" && d.u)) {
+    if (--fuel < 0 || (d?.$ === "Def" && (d.u || (nodes -= cf_nodes(d)) < 0))) {
       throw CF_OUT;
     }
     return d;
@@ -2134,6 +2156,7 @@ function file_new(book: Bend.Book, js: boolean) {
     made: Object.create(null) as Record<Name, Bend.Def>,
     cfk: new Map<string, Name | null>(),
     cffuel: CF_ALL,
+    cfn: new Map<Bend.Def, number>(),
     cfh: new Map<Name, HTerm>(),
     clos: new Map<Name, Map<string, Name | null>>(),
     clo_of: new Map<Name, { k: Name; n: number }>(),
