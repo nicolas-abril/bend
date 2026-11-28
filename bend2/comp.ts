@@ -5985,11 +5985,18 @@ function segs_fuse(segs: Seg[], dev: Set<string>): Seg[] {
 function leaf_defer(segs: Seg[], spins: Seg[], dev: Set<string>): void {
   const forks = new Set(segs.filter((s) => s.lines.some((l) =>
     l.includes("WL_FKNOTE("))).map((s) => s.def));
+  // the spins a segment's lines call, from its first line or its second
+  // on: each name a call's name ends in, as a test of "f(" in a line reads
+  const named = new Map<Seg, Set<string>[]>();
+  const called = (s: Seg, from: number): Set<string> => memo(named, s, () =>
+    [0, 1].map((j) => new Set(s.lines.slice(j).flatMap((l) =>
+      [...l.matchAll(/(\w+)\(/g)].flatMap(([, w]) =>
+        [...w.matchAll(/spin_|lane_/g)].map((m) => w.slice(m.index)))))))[from];
   const calls = (ss: Seg[], f: string) => ss.some((s) => s.fid !== f
-    && s.lines.some((l) => l.includes(f + "(")));
+    && called(s, 0).has(f));
   const loops = (s: Seg) => s.lines.some((l) => /\bWL_SPIN\b/.test(l));
   const inner = (s: Seg) => spins.filter((t) => t.fid !== s.fid
-    && s.lines.slice(1).some((l) => l.includes(t.fid + "(")));
+    && called(s, 1).has(t.fid));
   const heavy = new Map<string, boolean>();
   const runs = (s: Seg): boolean => heavy.get(s.fid) ?? (heavy.set(s.fid,
     false), heavy.set(s.fid, loops(s) || inner(s).some(runs)).get(s.fid)!);
